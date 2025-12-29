@@ -1,0 +1,15 @@
+name: Sync Fork
+on:
+  schedule:
+    - cron: '0 0 * * * *'  # every day at midnight
+  workflow_dispatch:  # on button click
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tgymnich/fork-sync@v1.8
+        with:
+          owner: steveyegge  # Upstream repository owner
+          base: main         # Your fork's target branch (where changes are merged)
+          head: main         # Upstream branch to sync from
+          # Note: Ensure your fork's repository is set as the target (via GITHUB_TOKEN)
