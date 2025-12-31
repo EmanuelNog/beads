@@ -43,6 +43,8 @@ const (
 	OpShutdown            = "shutdown"
 	OpDelete              = "delete"
 	OpGetWorkerStatus     = "get_worker_status"
+	OpGetConfig           = "get_config"
+	OpMolStale            = "mol_stale"
 
 	// Gate operations
 	OpGateCreate = "gate_create"
@@ -97,6 +99,14 @@ type CreateArgs struct {
 	CreatedBy string `json:"created_by,omitempty"` // Who created the issue
 	// Molecule type (for swarm coordination)
 	MolType string `json:"mol_type,omitempty"` // swarm, patrol, or work (default)
+	// Agent identity fields (only valid when IssueType == "agent")
+	RoleType string `json:"role_type,omitempty"` // polecat|crew|witness|refinery|mayor|deacon
+	Rig      string `json:"rig,omitempty"`       // Rig name (empty for town-level agents)
+	// Event fields (only valid when IssueType == "event")
+	EventCategory string `json:"event_category,omitempty"` // Namespaced category (e.g., patrol.muted, agent.started)
+	EventActor    string `json:"event_actor,omitempty"`    // Entity URI who caused this event
+	EventTarget   string `json:"event_target,omitempty"`   // Entity URI or bead ID affected
+	EventPayload  string `json:"event_payload,omitempty"`  // Event-specific JSON data
 }
 
 // UpdateArgs represents arguments for the update operation
@@ -134,6 +144,14 @@ type UpdateArgs struct {
 	// Agent state fields
 	AgentState   *string `json:"agent_state,omitempty"`   // Agent state (idle|running|stuck|stopped|dead)
 	LastActivity *bool   `json:"last_activity,omitempty"` // If true, update last_activity to now
+	// Agent identity fields
+	RoleType *string `json:"role_type,omitempty"` // polecat|crew|witness|refinery|mayor|deacon
+	Rig      *string `json:"rig,omitempty"`       // Rig name (empty for town-level agents)
+	// Event fields (only valid when IssueType == "event")
+	EventCategory *string `json:"event_category,omitempty"` // Namespaced category (e.g., patrol.muted, agent.started)
+	EventActor    *string `json:"event_actor,omitempty"`    // Entity URI who caused this event
+	EventTarget   *string `json:"event_target,omitempty"`   // Entity URI or bead ID affected
+	EventPayload  *string `json:"event_payload,omitempty"`  // Event-specific JSON data
 }
 
 // CloseArgs represents arguments for the close operation
@@ -208,6 +226,9 @@ type ListArgs struct {
 
 	// Molecule type filtering
 	MolType string `json:"mol_type,omitempty"`
+
+	// Status exclusion (for default non-closed behavior, GH#788)
+	ExcludeStatus []string `json:"exclude_status,omitempty"`
 }
 
 // CountArgs represents arguments for the count operation
@@ -548,4 +569,40 @@ type MoleculeProgress struct {
 	Title      string         `json:"title"`
 	Assignee   string         `json:"assignee"`
 	Steps      []MoleculeStep `json:"steps"`
+}
+
+// GetConfigArgs represents arguments for getting daemon config
+type GetConfigArgs struct {
+	Key string `json:"key"` // Config key to retrieve (e.g., "issue_prefix")
+}
+
+// GetConfigResponse represents the response from get_config operation
+type GetConfigResponse struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// MolStaleArgs represents arguments for the mol stale operation
+type MolStaleArgs struct {
+	BlockingOnly   bool `json:"blocking_only"`   // Only show molecules blocking other work
+	UnassignedOnly bool `json:"unassigned_only"` // Only show unassigned molecules
+	ShowAll        bool `json:"show_all"`        // Include molecules with 0 children
+}
+
+// StaleMolecule holds info about a stale molecule (for RPC response)
+type StaleMolecule struct {
+	ID             string   `json:"id"`
+	Title          string   `json:"title"`
+	TotalChildren  int      `json:"total_children"`
+	ClosedChildren int      `json:"closed_children"`
+	Assignee       string   `json:"assignee,omitempty"`
+	BlockingIssues []string `json:"blocking_issues,omitempty"`
+	BlockingCount  int      `json:"blocking_count"`
+}
+
+// MolStaleResponse holds the result of the mol stale operation
+type MolStaleResponse struct {
+	StaleMolecules []*StaleMolecule `json:"stale_molecules"`
+	TotalCount     int              `json:"total_count"`
+	BlockingCount  int              `json:"blocking_count"`
 }

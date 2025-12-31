@@ -144,11 +144,14 @@ var rootCmd = &cobra.Command{
 		_ = cmd.Help()
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Initialize CommandContext to hold runtime state (replaces scattered globals)
+		initCommandContext()
+
 		// Set up signal-aware context for graceful cancellation
 		rootCtx, rootCancel = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
-		// Signal Gas Town daemon about bd activity (best-effort, for exponential backoff)
-		defer signalGasTownActivity()
+		// Signal orchestrator daemon about bd activity (best-effort, for exponential backoff)
+		defer signalOrchestratorActivity()
 
 		// Apply verbosity flags early (before any output)
 		debug.SetVerbose(verboseFlag)
@@ -522,6 +525,7 @@ var rootCmd = &cobra.Command{
 								}
 								health, healthErr = client.Health()
 								if healthErr == nil && health.Status == statusHealthy {
+									client.SetActor(actor)
 									daemonClient = client
 									daemonStatus.Mode = cmdDaemon
 									daemonStatus.Connected = true
@@ -539,6 +543,7 @@ var rootCmd = &cobra.Command{
 							health.Version, Version)
 					} else {
 						// Daemon is healthy and compatible - use it
+						client.SetActor(actor)
 						daemonClient = client
 						daemonStatus.Mode = cmdDaemon
 						daemonStatus.Connected = true
@@ -589,6 +594,7 @@ var rootCmd = &cobra.Command{
 						// Check health of auto-started daemon
 						health, healthErr := client.Health()
 						if healthErr == nil && health.Status == statusHealthy {
+							client.SetActor(actor)
 							daemonClient = client
 							daemonStatus.Mode = cmdDaemon
 							daemonStatus.Connected = true
@@ -726,6 +732,9 @@ var rootCmd = &cobra.Command{
 
 		// Tips (including sync conflict proactive checks) are shown via maybeShowTip()
 		// after successful command execution, not in PreRun
+
+		// Sync all state to CommandContext for unified access
+		syncCommandContext()
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
 		// Handle --no-db mode: write memory storage back to JSONL

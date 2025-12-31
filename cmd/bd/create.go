@@ -121,6 +121,26 @@ var createCmd = &cobra.Command{
 			}
 		}
 
+		// Agent-specific flags
+		roleType, _ := cmd.Flags().GetString("role-type")
+		agentRig, _ := cmd.Flags().GetString("agent-rig")
+
+		// Validate agent-specific flags require --type=agent
+		if (roleType != "" || agentRig != "") && issueType != "agent" {
+			FatalError("--role-type and --agent-rig flags require --type=agent")
+		}
+
+		// Event-specific flags
+		eventCategory, _ := cmd.Flags().GetString("event-category")
+		eventActor, _ := cmd.Flags().GetString("event-actor")
+		eventTarget, _ := cmd.Flags().GetString("event-target")
+		eventPayload, _ := cmd.Flags().GetString("event-payload")
+
+		// Validate event-specific flags require --type=event
+		if (eventCategory != "" || eventActor != "" || eventTarget != "" || eventPayload != "") && issueType != "event" {
+			FatalError("--event-category, --event-actor, --event-target, and --event-payload flags require --type=event")
+		}
+
 		// Handle --rig or --prefix flag: create issue in a different rig
 		// Both flags use the same forgiving lookup (accepts rig names or prefixes)
 		targetRig := rigOverride
@@ -213,8 +233,12 @@ var createCmd = &cobra.Command{
 			// Get database prefix from config
 			var dbPrefix string
 			if daemonClient != nil {
-				// TODO(bd-ag35): Add RPC method to get config in daemon mode
-				// For now, skip validation in daemon mode (needs RPC enhancement)
+				// Daemon mode - use RPC to get config
+				configResp, err := daemonClient.GetConfig(&rpc.GetConfigArgs{Key: "issue_prefix"})
+				if err == nil {
+					dbPrefix = configResp.Value
+				}
+				// If error, continue without validation (non-fatal)
 			} else {
 				// Direct mode - check config
 				dbPrefix, _ = store.GetConfig(ctx, "issue_prefix")
@@ -258,6 +282,12 @@ var createCmd = &cobra.Command{
 				Ephemeral:          wisp,
 				CreatedBy:          getActorWithGit(),
 				MolType:            string(molType),
+				RoleType:           roleType,
+				Rig:                agentRig,
+				EventCategory:      eventCategory,
+				EventActor:         eventActor,
+				EventTarget:        eventTarget,
+				EventPayload:       eventPayload,
 			}
 
 			resp, err := daemonClient.Create(createArgs)
@@ -305,6 +335,12 @@ var createCmd = &cobra.Command{
 			Ephemeral:          wisp,
 			CreatedBy:          getActorWithGit(),
 			MolType:            molType,
+			RoleType:           roleType,
+			Rig:                agentRig,
+			EventKind:          eventCategory,
+			Actor:              eventActor,
+			Target:             eventTarget,
+			Payload:            eventPayload,
 		}
 
 		ctx := rootCtx
@@ -364,6 +400,22 @@ var createCmd = &cobra.Command{
 		for _, label := range labels {
 			if err := store.AddLabel(ctx, issue.ID, label, actor); err != nil {
 				WarnError("failed to add label %s: %v", label, err)
+			}
+		}
+
+		// Auto-add role_type/rig labels for agent beads (enables filtering queries)
+		if issue.IssueType == types.TypeAgent {
+			if issue.RoleType != "" {
+				agentLabel := "role_type:" + issue.RoleType
+				if err := store.AddLabel(ctx, issue.ID, agentLabel, actor); err != nil {
+					WarnError("failed to add role_type label: %v", err)
+				}
+			}
+			if issue.Rig != "" {
+				rigLabel := "rig:" + issue.Rig
+				if err := store.AddLabel(ctx, issue.ID, rigLabel, actor); err != nil {
+					WarnError("failed to add rig label: %v", err)
+				}
 			}
 		}
 
@@ -470,7 +522,7 @@ func init() {
 	createCmd.Flags().String("title", "", "Issue title (alternative to positional argument)")
 	createCmd.Flags().Bool("silent", false, "Output only the issue ID (for scripting)")
 	registerPriorityFlag(createCmd, "2")
-	createCmd.Flags().StringP("type", "t", "task", "Issue type (bug|feature|task|epic|chore|merge-request|molecule|gate|agent|role)")
+	createCmd.Flags().StringP("type", "t", "task", "Issue type (bug|feature|task|epic|chore|merge-request|molecule|gate|agent|role|convoy|event)")
 	registerCommonIssueFlags(createCmd)
 	createCmd.Flags().StringSliceP("labels", "l", []string{}, "Labels (comma-separated)")
 	createCmd.Flags().StringSlice("label", []string{}, "Alias for --labels")
@@ -487,6 +539,14 @@ func init() {
 	createCmd.Flags().IntP("estimate", "e", 0, "Time estimate in minutes (e.g., 60 for 1 hour)")
 	createCmd.Flags().Bool("ephemeral", false, "Create as ephemeral (ephemeral, not exported to JSONL)")
 	createCmd.Flags().String("mol-type", "", "Molecule type: swarm (multi-polecat), patrol (recurring ops), work (default)")
+	// Agent-specific flags (only valid when --type=agent)
+	createCmd.Flags().String("role-type", "", "Agent role type: polecat|crew|witness|refinery|mayor|deacon (requires --type=agent)")
+	createCmd.Flags().String("agent-rig", "", "Agent's rig name (requires --type=agent)")
+	// Event-specific flags (only valid when --type=event)
+	createCmd.Flags().String("event-category", "", "Event category (e.g., patrol.muted, agent.started) (requires --type=event)")
+	createCmd.Flags().String("event-actor", "", "Entity URI who caused this event (requires --type=event)")
+	createCmd.Flags().String("event-target", "", "Entity URI or bead ID affected (requires --type=event)")
+	createCmd.Flags().String("event-payload", "", "Event-specific JSON data (requires --type=event)")
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(createCmd)
 }

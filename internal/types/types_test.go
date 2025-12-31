@@ -464,12 +464,12 @@ func TestIssueCompoundHelpers(t *testing.T) {
 		t.Fatalf("expected nil constituents for non-compound issue")
 	}
 
-	bonded := &Issue{BondedFrom: []BondRef{{ProtoID: "proto-1", BondType: BondTypeSequential}}}
+	bonded := &Issue{BondedFrom: []BondRef{{SourceID: "proto-1", BondType: BondTypeSequential}}}
 	if !bonded.IsCompound() {
 		t.Fatalf("issue with bonded refs should be compound")
 	}
 	refs := bonded.GetConstituents()
-	if len(refs) != 1 || refs[0].ProtoID != "proto-1" {
+	if len(refs) != 1 || refs[0].SourceID != "proto-1" {
 		t.Fatalf("unexpected constituents: %#v", refs)
 	}
 }
@@ -522,6 +522,10 @@ func TestDependencyTypeIsWellKnown(t *testing.T) {
 		{DepAuthoredBy, true},
 		{DepAssignedTo, true},
 		{DepApprovedBy, true},
+		{DepTracks, true},
+		{DepUntil, true},
+		{DepCausedBy, true},
+		{DepValidates, true},
 		{DependencyType("custom-type"), false},
 		{DependencyType("unknown"), false},
 	}
@@ -553,6 +557,10 @@ func TestDependencyTypeAffectsReadyWork(t *testing.T) {
 		{DepAuthoredBy, false},
 		{DepAssignedTo, false},
 		{DepApprovedBy, false},
+		{DepTracks, false},
+		{DepUntil, false},
+		{DepCausedBy, false},
+		{DepValidates, false},
 		{DependencyType("custom-type"), false},
 	}
 
