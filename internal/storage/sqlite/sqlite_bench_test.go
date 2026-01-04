@@ -180,7 +180,7 @@ func BenchmarkBulkCloseIssues(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		for j, issue := range issues {
-			if err := store.CloseIssue(ctx, issue.ID, "Bulk closed", "bench"); err != nil {
+			if err := store.CloseIssue(ctx, issue.ID, "Bulk closed", "bench", ""); err != nil {
 				b.Fatalf("CloseIssue failed: %v", err)
 			}
 			// Re-open for next iteration (except last one)
@@ -232,6 +232,39 @@ func BenchmarkSyncMerge(b *testing.B) {
 				}
 				_ = store.UpdateIssue(ctx, issue.ID, updates, "sync")
 			}
+		}
+	}
+}
+
+// BenchmarkRebuildBlockedCache_Large benchmarks cache rebuild in isolation on 10K database
+// This measures the core operation that bd-zw72 is investigating for incremental optimization
+func BenchmarkRebuildBlockedCache_Large(b *testing.B) {
+	store, cleanup := setupLargeBenchDB(b)
+	defer cleanup()
+	ctx := context.Background()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		if err := store.rebuildBlockedCache(ctx, nil); err != nil {
+			b.Fatalf("rebuildBlockedCache failed: %v", err)
+		}
+	}
+}
+
+// BenchmarkRebuildBlockedCache_XLarge benchmarks cache rebuild in isolation on 20K database
+func BenchmarkRebuildBlockedCache_XLarge(b *testing.B) {
+	store, cleanup := setupXLargeBenchDB(b)
+	defer cleanup()
+	ctx := context.Background()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		if err := store.rebuildBlockedCache(ctx, nil); err != nil {
+			b.Fatalf("rebuildBlockedCache failed: %v", err)
 		}
 	}
 }

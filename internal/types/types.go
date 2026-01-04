@@ -36,8 +36,13 @@ type Issue struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	CreatedBy   string     `json:"created_by,omitempty"` // Who created this issue (GH#748)
 	UpdatedAt   time.Time  `json:"updated_at"`
-	ClosedAt    *time.Time `json:"closed_at,omitempty"`
-	CloseReason string     `json:"close_reason,omitempty"` // Reason provided when closing
+	ClosedAt        *time.Time `json:"closed_at,omitempty"`
+	CloseReason     string     `json:"close_reason,omitempty"`      // Reason provided when closing
+	ClosedBySession string     `json:"closed_by_session,omitempty"` // Claude Code session that closed this issue
+
+	// ===== Time-Based Scheduling (GH#820) =====
+	DueAt      *time.Time `json:"due_at,omitempty"`      // When this issue should be completed
+	DeferUntil *time.Time `json:"defer_until,omitempty"` // Hide from bd ready until this time
 
 	// ===== External Integration =====
 	ExternalRef *string `json:"external_ref,omitempty"` // e.g., "gh-9", "jira-ABC"
@@ -85,6 +90,9 @@ type Issue struct {
 	AwaitID   string        `json:"await_id,omitempty"`   // Condition identifier (run ID, PR number, etc.)
 	Timeout   time.Duration `json:"timeout,omitempty"`    // Max wait time before escalation
 	Waiters   []string      `json:"waiters,omitempty"`    // Mail addresses to notify when gate clears
+
+	// ===== Slot Fields (exclusive access primitives) =====
+	Holder string `json:"holder,omitempty"` // Who currently holds the slot (empty = available)
 
 	// ===== Source Tracing Fields (formula cooking origin) =====
 	SourceFormula  string `json:"source_formula,omitempty"`  // Formula name where step was defined
@@ -157,6 +165,9 @@ func (i *Issue) ComputeContentHash() string {
 	for _, waiter := range i.Waiters {
 		w.str(waiter)
 	}
+
+	// Slot fields for exclusive access
+	w.str(i.Holder)
 
 	// Agent identity fields
 	w.str(i.HookBead)
@@ -408,15 +419,47 @@ const (
 	TypeRole         IssueType = "role"          // Agent role definition
 	TypeConvoy       IssueType = "convoy"        // Cross-project tracking with reactive completion
 	TypeEvent        IssueType = "event"         // Operational state change record
+	TypeSlot         IssueType = "slot"          // Exclusive access slot (merge-slot gate)
 )
 
 // IsValid checks if the issue type value is valid
 func (t IssueType) IsValid() bool {
 	switch t {
-	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeMessage, TypeMergeRequest, TypeMolecule, TypeGate, TypeAgent, TypeRole, TypeConvoy, TypeEvent:
+	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeMessage, TypeMergeRequest, TypeMolecule, TypeGate, TypeAgent, TypeRole, TypeConvoy, TypeEvent, TypeSlot:
 		return true
 	}
 	return false
+}
+
+// RequiredSection describes a recommended section for an issue type.
+// Used by bd lint and bd create --validate for template validation.
+type RequiredSection struct {
+	Heading string // Markdown heading, e.g., "## Steps to Reproduce"
+	Hint    string // Guidance for what to include
+}
+
+// RequiredSections returns the recommended sections for this issue type.
+// Returns nil for types with no specific section requirements.
+func (t IssueType) RequiredSections() []RequiredSection {
+	switch t {
+	case TypeBug:
+		return []RequiredSection{
+			{Heading: "## Steps to Reproduce", Hint: "Describe how to reproduce the bug"},
+			{Heading: "## Acceptance Criteria", Hint: "Define criteria to verify the fix"},
+		}
+	case TypeTask, TypeFeature:
+		return []RequiredSection{
+			{Heading: "## Acceptance Criteria", Hint: "Define criteria to verify completion"},
+		}
+	case TypeEpic:
+		return []RequiredSection{
+			{Heading: "## Success Criteria", Hint: "Define high-level success criteria"},
+		}
+	default:
+		// Chore, message, molecule, gate, agent, role, convoy, event, merge-request
+		// have no required sections
+		return nil
+	}
 }
 
 // AgentState represents the self-reported state of an agent
@@ -677,6 +720,19 @@ type TreeNode struct {
 	Truncated bool   `json:"truncated"`
 }
 
+// MoleculeProgressStats provides efficient progress info for large molecules.
+// This uses indexed queries instead of loading all steps into memory.
+type MoleculeProgressStats struct {
+	MoleculeID    string     `json:"molecule_id"`
+	MoleculeTitle string     `json:"molecule_title"`
+	Total         int        `json:"total"`           // Total steps (direct children)
+	Completed     int        `json:"completed"`       // Closed steps
+	InProgress    int        `json:"in_progress"`     // Steps currently in progress
+	CurrentStepID string     `json:"current_step_id"` // First in_progress step ID (if any)
+	FirstClosed   *time.Time `json:"first_closed,omitempty"`
+	LastClosed    *time.Time `json:"last_closed,omitempty"`
+}
+
 // Statistics provides aggregate metrics
 type Statistics struct {
 	TotalIssues              int     `json:"total_issues"`
@@ -746,6 +802,17 @@ type IssueFilter struct {
 
 	// Status exclusion (for default non-closed behavior)
 	ExcludeStatus []Status // Exclude issues with these statuses
+
+	// Type exclusion (for hiding internal types like gates)
+	ExcludeTypes []IssueType // Exclude issues with these types
+
+	// Time-based scheduling filters (GH#820)
+	Deferred    bool       // Filter issues with defer_until set (any value)
+	DeferAfter  *time.Time // Filter issues with defer_until > this time
+	DeferBefore *time.Time // Filter issues with defer_until < this time
+	DueAfter    *time.Time // Filter issues with due_at > this time
+	DueBefore   *time.Time // Filter issues with due_at < this time
+	Overdue     bool       // Filter issues where due_at < now AND status != closed
 }
 
 // SortPolicy determines how ready work is ordered
@@ -793,6 +860,9 @@ type WorkFilter struct {
 
 	// Molecule type filtering
 	MolType *MolType // Filter by molecule type (nil = any, swarm/patrol/work)
+
+	// Time-based deferral filtering (GH#820)
+	IncludeDeferred bool // If true, include issues with future defer_until timestamps
 }
 
 // StaleFilter is used to filter stale issue queries

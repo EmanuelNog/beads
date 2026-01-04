@@ -20,28 +20,18 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/util"
 	"github.com/steveyegge/beads/internal/validation"
 )
 
-// parseTimeFlag parses time strings in multiple formats
+// parseTimeFlag parses time strings using the layered time parsing architecture.
+// Supports compact durations (+6h, -1d), natural language (tomorrow, next monday),
+// and absolute formats (2006-01-02, RFC3339).
 func parseTimeFlag(s string) (time.Time, error) {
-	formats := []string{
-		time.RFC3339,
-		"2006-01-02",
-		"2006-01-02T15:04:05",
-		"2006-01-02 15:04:05",
-	}
-
-	for _, format := range formats {
-		if t, err := time.Parse(format, s); err == nil {
-			return t, nil
-		}
-	}
-
-	return time.Time{}, fmt.Errorf("unable to parse time %q (try formats: 2006-01-02, 2006-01-02T15:04:05, or RFC3339)", s)
+	return timeparsing.ParseRelativeTime(s, time.Now())
 }
 
 // pinIndicator returns a pushpin emoji prefix for pinned issues
@@ -375,6 +365,7 @@ var listCmd = &cobra.Command{
 		status, _ := cmd.Flags().GetString("status")
 		assignee, _ := cmd.Flags().GetString("assignee")
 		issueType, _ := cmd.Flags().GetString("type")
+		issueType = util.NormalizeIssueType(issueType) // Expand aliases (mr→merge-request, etc.)
 		limit, _ := cmd.Flags().GetInt("limit")
 		allFlag, _ := cmd.Flags().GetBool("all")
 		formatStr, _ := cmd.Flags().GetString("format")
@@ -385,12 +376,12 @@ var listCmd = &cobra.Command{
 		longFormat, _ := cmd.Flags().GetBool("long")
 		sortBy, _ := cmd.Flags().GetString("sort")
 		reverse, _ := cmd.Flags().GetBool("reverse")
-		
+
 		// Pattern matching flags
 		titleContains, _ := cmd.Flags().GetString("title-contains")
 		descContains, _ := cmd.Flags().GetString("desc-contains")
 		notesContains, _ := cmd.Flags().GetString("notes-contains")
-		
+
 		// Date range flags
 		createdAfter, _ := cmd.Flags().GetString("created-after")
 		createdBefore, _ := cmd.Flags().GetString("created-before")
@@ -398,12 +389,12 @@ var listCmd = &cobra.Command{
 		updatedBefore, _ := cmd.Flags().GetString("updated-before")
 		closedAfter, _ := cmd.Flags().GetString("closed-after")
 		closedBefore, _ := cmd.Flags().GetString("closed-before")
-		
+
 		// Empty/null check flags
 		emptyDesc, _ := cmd.Flags().GetBool("empty-description")
 		noAssignee, _ := cmd.Flags().GetBool("no-assignee")
 		noLabels, _ := cmd.Flags().GetBool("no-labels")
-		
+
 		// Priority range flags
 		priorityMinStr, _ := cmd.Flags().GetString("priority-min")
 		priorityMaxStr, _ := cmd.Flags().GetString("priority-max")
@@ -414,6 +405,9 @@ var listCmd = &cobra.Command{
 
 		// Template filtering
 		includeTemplates, _ := cmd.Flags().GetBool("include-templates")
+
+		// Gate filtering (bd-7zka.2)
+		includeGates, _ := cmd.Flags().GetBool("include-gates")
 
 		// Parent filtering
 		parentID, _ := cmd.Flags().GetString("parent")
@@ -429,6 +423,14 @@ var listCmd = &cobra.Command{
 			}
 			molType = &mt
 		}
+
+		// Time-based scheduling filters (GH#820)
+		deferredFlag, _ := cmd.Flags().GetBool("deferred")
+		deferAfter, _ := cmd.Flags().GetString("defer-after")
+		deferBefore, _ := cmd.Flags().GetString("defer-before")
+		dueAfter, _ := cmd.Flags().GetString("due-after")
+		dueBefore, _ := cmd.Flags().GetString("due-before")
+		overdueFlag, _ := cmd.Flags().GetBool("overdue")
 
 		// Pretty and watch flags (GH#654)
 		prettyFormat, _ := cmd.Flags().GetBool("pretty")
@@ -509,7 +511,7 @@ var listCmd = &cobra.Command{
 				filter.IDs = ids
 			}
 		}
-		
+
 		// Pattern matching
 		if titleContains != "" {
 			filter.TitleContains = titleContains
@@ -520,7 +522,7 @@ var listCmd = &cobra.Command{
 		if notesContains != "" {
 			filter.NotesContains = notesContains
 		}
-		
+
 		// Date ranges
 		if createdAfter != "" {
 			t, err := parseTimeFlag(createdAfter)
@@ -570,7 +572,7 @@ var listCmd = &cobra.Command{
 			}
 			filter.ClosedBefore = &t
 		}
-		
+
 		// Empty/null checks
 		if emptyDesc {
 			filter.EmptyDescription = true
@@ -581,7 +583,7 @@ var listCmd = &cobra.Command{
 		if noLabels {
 			filter.NoLabels = true
 		}
-		
+
 		// Priority ranges
 		if cmd.Flags().Changed("priority-min") {
 			priorityMin, err := validation.ValidatePriority(priorityMinStr)
@@ -620,6 +622,12 @@ var listCmd = &cobra.Command{
 			filter.IsTemplate = &isTemplate
 		}
 
+		// Gate filtering: exclude gate issues by default (bd-7zka.2)
+		// Use --include-gates or --type gate to show gate issues
+		if !includeGates && issueType != "gate" {
+			filter.ExcludeTypes = append(filter.ExcludeTypes, types.TypeGate)
+		}
+
 		// Parent filtering: filter children by parent issue
 		if parentID != "" {
 			filter.ParentID = &parentID
@@ -628,6 +636,46 @@ var listCmd = &cobra.Command{
 		// Molecule type filtering
 		if molType != nil {
 			filter.MolType = molType
+		}
+
+		// Time-based scheduling filters (GH#820)
+		if deferredFlag {
+			filter.Deferred = true
+		}
+		if deferAfter != "" {
+			t, err := parseTimeFlag(deferAfter)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing --defer-after: %v\n", err)
+				os.Exit(1)
+			}
+			filter.DeferAfter = &t
+		}
+		if deferBefore != "" {
+			t, err := parseTimeFlag(deferBefore)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing --defer-before: %v\n", err)
+				os.Exit(1)
+			}
+			filter.DeferBefore = &t
+		}
+		if dueAfter != "" {
+			t, err := parseTimeFlag(dueAfter)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing --due-after: %v\n", err)
+				os.Exit(1)
+			}
+			filter.DueAfter = &t
+		}
+		if dueBefore != "" {
+			t, err := parseTimeFlag(dueBefore)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing --due-before: %v\n", err)
+				os.Exit(1)
+			}
+			filter.DueBefore = &t
+		}
+		if overdueFlag {
+			filter.Overdue = true
 		}
 
 		// Check database freshness before reading
@@ -640,7 +688,7 @@ var listCmd = &cobra.Command{
 			}
 		}
 
-	// If daemon is running, use RPC
+		// If daemon is running, use RPC
 		if daemonClient != nil {
 			listArgs := &rpc.ListArgs{
 				Status:    status,
@@ -665,17 +713,17 @@ var listCmd = &cobra.Command{
 			}
 			// Forward title search via Query field (searches title/description/id)
 			if titleSearch != "" {
-			 listArgs.Query = titleSearch
+				listArgs.Query = titleSearch
 			}
-			 if len(filter.IDs) > 0 {
-			listArgs.IDs = filter.IDs
-			 }
-			
+			if len(filter.IDs) > 0 {
+				listArgs.IDs = filter.IDs
+			}
+
 			// Pattern matching
 			listArgs.TitleContains = titleContains
 			listArgs.DescriptionContains = descContains
 			listArgs.NotesContains = notesContains
-			
+
 			// Date ranges
 			if filter.CreatedAfter != nil {
 				listArgs.CreatedAfter = filter.CreatedAfter.Format(time.RFC3339)
@@ -695,12 +743,12 @@ var listCmd = &cobra.Command{
 			if filter.ClosedBefore != nil {
 				listArgs.ClosedBefore = filter.ClosedBefore.Format(time.RFC3339)
 			}
-			
+
 			// Empty/null checks
 			listArgs.EmptyDescription = filter.EmptyDescription
 			listArgs.NoAssignee = filter.NoAssignee
 			listArgs.NoLabels = filter.NoLabels
-			
+
 			// Priority range
 			listArgs.PriorityMin = filter.PriorityMin
 			listArgs.PriorityMax = filter.PriorityMax
@@ -721,7 +769,30 @@ var listCmd = &cobra.Command{
 				}
 			}
 
-			 resp, err := daemonClient.List(listArgs)
+			// Type exclusion (bd-7zka.2)
+			if len(filter.ExcludeTypes) > 0 {
+				for _, t := range filter.ExcludeTypes {
+					listArgs.ExcludeTypes = append(listArgs.ExcludeTypes, string(t))
+				}
+			}
+
+			// Time-based scheduling filters (GH#820)
+			listArgs.Deferred = filter.Deferred
+			if filter.DeferAfter != nil {
+				listArgs.DeferAfter = filter.DeferAfter.Format(time.RFC3339)
+			}
+			if filter.DeferBefore != nil {
+				listArgs.DeferBefore = filter.DeferBefore.Format(time.RFC3339)
+			}
+			if filter.DueAfter != nil {
+				listArgs.DueAfter = filter.DueAfter.Format(time.RFC3339)
+			}
+			if filter.DueBefore != nil {
+				listArgs.DueBefore = filter.DueBefore.Format(time.RFC3339)
+			}
+			listArgs.Overdue = filter.Overdue
+
+			resp, err := daemonClient.List(listArgs)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
@@ -774,7 +845,9 @@ var listCmd = &cobra.Command{
 
 			// Output with pager support
 			if err := ui.ToPager(buf.String(), ui.PagerOptions{NoPager: noPager}); err != nil {
-				fmt.Fprint(os.Stdout, buf.String())
+				if _, writeErr := fmt.Fprint(os.Stdout, buf.String()); writeErr != nil {
+					fmt.Fprintf(os.Stderr, "Error writing output: %v\n", writeErr)
+				}
 			}
 
 			// Show truncation hint if we hit the limit (GH#788)
@@ -788,21 +861,21 @@ var listCmd = &cobra.Command{
 		// ctx already created above for staleness check
 		issues, err := store.SearchIssues(ctx, "", filter)
 		if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
 
-	// If no issues found, check if git has issues and auto-import
-	if len(issues) == 0 {
-		if checkAndAutoImport(ctx, store) {
-			// Re-run the query after import
-			issues, err = store.SearchIssues(ctx, "", filter)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+		// If no issues found, check if git has issues and auto-import
+		if len(issues) == 0 {
+			if checkAndAutoImport(ctx, store) {
+				// Re-run the query after import
+				issues, err = store.SearchIssues(ctx, "", filter)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
 			}
 		}
-	}
 
 		// Apply sorting
 		sortIssues(issues, sortBy, reverse)
@@ -899,7 +972,9 @@ var listCmd = &cobra.Command{
 
 		// Output with pager support
 		if err := ui.ToPager(buf.String(), ui.PagerOptions{NoPager: noPager}); err != nil {
-			fmt.Fprint(os.Stdout, buf.String())
+			if _, writeErr := fmt.Fprint(os.Stdout, buf.String()); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "Error writing output: %v\n", writeErr)
+			}
 		}
 
 		// Show truncation hint if we hit the limit (GH#788)
@@ -916,7 +991,7 @@ func init() {
 	listCmd.Flags().StringP("status", "s", "", "Filter by status (open, in_progress, blocked, deferred, closed)")
 	registerPriorityFlag(listCmd, "")
 	listCmd.Flags().StringP("assignee", "a", "", "Filter by assignee")
-	listCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, merge-request, molecule, gate, convoy)")
+	listCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, merge-request, molecule, gate, convoy). Aliases: mr→merge-request, feat→feature, mol→molecule")
 	listCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
 	listCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
 	listCmd.Flags().String("title", "", "Filter by title text (case-insensitive substring match)")
@@ -927,12 +1002,12 @@ func init() {
 	listCmd.Flags().Bool("long", false, "Show detailed multi-line output for each issue")
 	listCmd.Flags().String("sort", "", "Sort by field: priority, created, updated, closed, status, id, title, type, assignee")
 	listCmd.Flags().BoolP("reverse", "r", false, "Reverse sort order")
-	
+
 	// Pattern matching
 	listCmd.Flags().String("title-contains", "", "Filter by title substring (case-insensitive)")
 	listCmd.Flags().String("desc-contains", "", "Filter by description substring (case-insensitive)")
 	listCmd.Flags().String("notes-contains", "", "Filter by notes substring (case-insensitive)")
-	
+
 	// Date ranges
 	listCmd.Flags().String("created-after", "", "Filter issues created after date (YYYY-MM-DD or RFC3339)")
 	listCmd.Flags().String("created-before", "", "Filter issues created before date (YYYY-MM-DD or RFC3339)")
@@ -940,12 +1015,12 @@ func init() {
 	listCmd.Flags().String("updated-before", "", "Filter issues updated before date (YYYY-MM-DD or RFC3339)")
 	listCmd.Flags().String("closed-after", "", "Filter issues closed after date (YYYY-MM-DD or RFC3339)")
 	listCmd.Flags().String("closed-before", "", "Filter issues closed before date (YYYY-MM-DD or RFC3339)")
-	
+
 	// Empty/null checks
 	listCmd.Flags().Bool("empty-description", false, "Filter issues with empty or missing description")
 	listCmd.Flags().Bool("no-assignee", false, "Filter issues with no assignee")
 	listCmd.Flags().Bool("no-labels", false, "Filter issues with no labels")
-	
+
 	// Priority ranges
 	listCmd.Flags().String("priority-min", "", "Filter by minimum priority (inclusive, 0-4 or P0-P4)")
 	listCmd.Flags().String("priority-max", "", "Filter by maximum priority (inclusive, 0-4 or P0-P4)")
@@ -957,11 +1032,22 @@ func init() {
 	// Template filtering: exclude templates by default
 	listCmd.Flags().Bool("include-templates", false, "Include template molecules in output")
 
+	// Gate filtering: exclude gate issues by default (bd-7zka.2)
+	listCmd.Flags().Bool("include-gates", false, "Include gate issues in output (normally hidden)")
+
 	// Parent filtering: filter children by parent issue
 	listCmd.Flags().String("parent", "", "Filter by parent issue ID (shows children of specified issue)")
 
 	// Molecule type filtering
 	listCmd.Flags().String("mol-type", "", "Filter by molecule type: swarm, patrol, or work")
+
+	// Time-based scheduling filters (GH#820)
+	listCmd.Flags().Bool("deferred", false, "Show only issues with defer_until set")
+	listCmd.Flags().String("defer-after", "", "Filter issues deferred after date (supports relative: +6h, tomorrow)")
+	listCmd.Flags().String("defer-before", "", "Filter issues deferred before date (supports relative: +6h, tomorrow)")
+	listCmd.Flags().String("due-after", "", "Filter issues due after date (supports relative: +6h, tomorrow)")
+	listCmd.Flags().String("due-before", "", "Filter issues due before date (supports relative: +6h, tomorrow)")
+	listCmd.Flags().Bool("overdue", false, "Show only issues with due_at in the past (not closed)")
 
 	// Pretty and watch flags (GH#654)
 	listCmd.Flags().Bool("pretty", false, "Display issues in a tree format with status/priority symbols")

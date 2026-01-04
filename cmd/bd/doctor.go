@@ -382,6 +382,11 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, claudeCheck)
 	// Don't fail overall check for missing Claude integration, just warn
 
+	// Check 11b: Gemini CLI integration
+	geminiCheck := convertWithCategory(doctor.CheckGemini(), doctor.CategoryIntegration)
+	result.Checks = append(result.Checks, geminiCheck)
+	// Don't fail overall check for missing Gemini integration, just info
+
 	// Check 11a: bd in PATH (needed for Claude hooks to work)
 	bdPathCheck := convertWithCategory(doctor.CheckBdInPath(), doctor.CategoryIntegration)
 	result.Checks = append(result.Checks, bdPathCheck)
@@ -411,6 +416,11 @@ func runDiagnostics(path string) doctorResult {
 	issuesTrackingCheck := convertWithCategory(doctor.CheckIssuesTracking(), doctor.CategoryGit)
 	result.Checks = append(result.Checks, issuesTrackingCheck)
 	// Don't fail overall check for tracking issues, just warn
+
+	// Check 14b: redirect file tracking (worktree redirect files shouldn't be committed)
+	redirectTrackingCheck := convertWithCategory(doctor.CheckRedirectNotTracked(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, redirectTrackingCheck)
+	// Don't fail overall check for redirect tracking, just warn
 
 	// Check 15: Git merge driver configuration
 	mergeDriverCheck := convertWithCategory(doctor.CheckMergeDriver(path), doctor.CategoryGit)
@@ -446,6 +456,11 @@ func runDiagnostics(path string) doctorResult {
 	orphanedIssuesCheck := convertWithCategory(doctor.CheckOrphanedIssues(path), doctor.CategoryGit)
 	result.Checks = append(result.Checks, orphanedIssuesCheck)
 	// Don't fail overall check for orphaned issues, just warn
+
+	// Check 17c: Sync branch gitignore flags (GH#870)
+	syncBranchGitignoreCheck := convertWithCategory(doctor.CheckSyncBranchGitignore(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, syncBranchGitignoreCheck)
+	// Don't fail overall check for sync branch gitignore, just warn
 
 	// Check 18: Deletions manifest (legacy, now replaced by tombstones)
 	deletionsCheck := convertWithCategory(doctor.CheckDeletionsManifest(path), doctor.CategoryMetadata)

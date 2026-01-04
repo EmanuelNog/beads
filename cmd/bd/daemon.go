@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/beads/internal/daemon"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/syncbranch"
 )
 
 var daemonCmd = &cobra.Command{
@@ -108,8 +109,10 @@ Run 'bd daemon' with no flags to see available options.`,
 								autoPull = false
 							}
 						} else {
-							// Default: auto_pull is true when sync.branch is configured
-							if syncBranch, err := store.GetConfig(ctx, "sync.branch"); err == nil && syncBranch != "" {
+							// Default: auto_pull is true when sync-branch is configured
+							// Use syncbranch.IsConfigured() which checks env var and config.yaml
+							// (the common case), not just SQLite (legacy)
+							if syncbranch.IsConfigured() {
 								autoPull = true
 							}
 						}
@@ -449,6 +452,12 @@ func runDaemonLoop(interval time.Duration, autoCommit, autoPush, autoPull, local
 	} else if err := validateDatabaseFingerprint(ctx, store, &log); err != nil {
 		if os.Getenv("BEADS_IGNORE_REPO_MISMATCH") != "1" {
 			log.Error("repository fingerprint validation failed", "error", err)
+			// Write error to daemon-error file so user sees it instead of just "daemon took too long"
+			errFile := filepath.Join(beadsDir, "daemon-error")
+			// nolint:gosec // G306: Error file needs to be readable for debugging
+			if writeErr := os.WriteFile(errFile, []byte(err.Error()), 0644); writeErr != nil {
+				log.Warn("could not write daemon-error file", "error", writeErr)
+			}
 			return // Use return instead of os.Exit to allow defers to run
 		}
 		log.Warn("repository mismatch ignored (BEADS_IGNORE_REPO_MISMATCH=1)")

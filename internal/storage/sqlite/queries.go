@@ -286,6 +286,9 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	var actor sql.NullString
 	var target sql.NullString
 	var payload sql.NullString
+	// Time-based scheduling fields (GH#820)
+	var dueAt sql.NullTime
+	var deferUntil sql.NullTime
 
 	var contentHash sql.NullString
 	var compactedAtCommit sql.NullString
@@ -298,7 +301,8 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 		       sender, ephemeral, pinned, is_template,
 		       await_type, await_id, timeout_ns, waiters,
 		       hook_bead, role_bead, agent_state, last_activity, role_type, rig, mol_type,
-		       event_kind, actor, target, payload
+		       event_kind, actor, target, payload,
+		       due_at, defer_until
 		FROM issues
 		WHERE id = ?
 	`, id).Scan(
@@ -312,6 +316,7 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 		&awaitType, &awaitID, &timeoutNs, &waiters,
 		&hookBead, &roleBead, &agentState, &lastActivity, &roleType, &rig, &molType,
 		&eventKind, &actor, &target, &payload,
+		&dueAt, &deferUntil,
 	)
 
 	if err == sql.ErrNoRows {
@@ -425,6 +430,13 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	}
 	if payload.Valid {
 		issue.Payload = payload.String
+	}
+	// Time-based scheduling fields (GH#820)
+	if dueAt.Valid {
+		issue.DueAt = &dueAt.Time
+	}
+	if deferUntil.Valid {
+		issue.DeferUntil = &deferUntil.Time
 	}
 
 	// Fetch labels for this issue
@@ -664,6 +676,8 @@ var allowedUpdateFields = map[string]bool{
 	"estimated_minutes":   true,
 	"external_ref":        true,
 	"closed_at":           true,
+	"close_reason":        true,
+	"closed_by_session":   true,
 	// Messaging fields
 	"sender": true,
 	"wisp":   true, // Database column is 'ephemeral', mapped in UpdateIssue
@@ -685,6 +699,11 @@ var allowedUpdateFields = map[string]bool{
 	"event_actor":    true,
 	"event_target":   true,
 	"event_payload":  true,
+	// Time-based scheduling fields (GH#820)
+	"due_at":      true,
+	"defer_until": true,
+	// Gate fields (bd-z6kw: support await_id updates for gate discovery)
+	"await_id": true,
 }
 
 // validatePriority validates a priority value
@@ -1070,8 +1089,9 @@ func (s *SQLiteStorage) ResetCounter(ctx context.Context, prefix string) error {
 	return nil
 }
 
-// CloseIssue closes an issue with a reason
-func (s *SQLiteStorage) CloseIssue(ctx context.Context, id string, reason string, actor string) error {
+// CloseIssue closes an issue with a reason.
+// The session parameter tracks which Claude Code session closed the issue (can be empty).
+func (s *SQLiteStorage) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
 	now := time.Now()
 
 	// Update with special event handling
@@ -1086,9 +1106,9 @@ func (s *SQLiteStorage) CloseIssue(ctx context.Context, id string, reason string
 	// 2. events.comment - for audit history (when was it closed, by whom)
 	// Keep both in sync. If refactoring, consider deriving one from the other.
 	result, err := tx.ExecContext(ctx, `
-		UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?
+		UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?
 		WHERE id = ?
-	`, types.StatusClosed, now, now, reason, id)
+	`, types.StatusClosed, now, now, reason, session, id)
 	if err != nil {
 		return fmt.Errorf("failed to close issue: %w", err)
 	}
@@ -1716,6 +1736,16 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 		whereClauses = append(whereClauses, fmt.Sprintf("status NOT IN (%s)", strings.Join(placeholders, ",")))
 	}
 
+	// Type exclusion (for hiding internal types like gates, bd-7zka.2)
+	if len(filter.ExcludeTypes) > 0 {
+		placeholders := make([]string, len(filter.ExcludeTypes))
+		for i, t := range filter.ExcludeTypes {
+			placeholders[i] = "?"
+			args = append(args, string(t))
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("issue_type NOT IN (%s)", strings.Join(placeholders, ",")))
+	}
+
 	if filter.Priority != nil {
 		whereClauses = append(whereClauses, "priority = ?")
 		args = append(args, *filter.Priority)
@@ -1843,6 +1873,31 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 	if filter.MolType != nil {
 		whereClauses = append(whereClauses, "mol_type = ?")
 		args = append(args, string(*filter.MolType))
+	}
+
+	// Time-based scheduling filters (GH#820)
+	if filter.Deferred {
+		whereClauses = append(whereClauses, "defer_until IS NOT NULL")
+	}
+	if filter.DeferAfter != nil {
+		whereClauses = append(whereClauses, "defer_until > ?")
+		args = append(args, filter.DeferAfter.Format(time.RFC3339))
+	}
+	if filter.DeferBefore != nil {
+		whereClauses = append(whereClauses, "defer_until < ?")
+		args = append(args, filter.DeferBefore.Format(time.RFC3339))
+	}
+	if filter.DueAfter != nil {
+		whereClauses = append(whereClauses, "due_at > ?")
+		args = append(args, filter.DueAfter.Format(time.RFC3339))
+	}
+	if filter.DueBefore != nil {
+		whereClauses = append(whereClauses, "due_at < ?")
+		args = append(args, filter.DueBefore.Format(time.RFC3339))
+	}
+	if filter.Overdue {
+		whereClauses = append(whereClauses, "due_at IS NOT NULL AND due_at < ? AND status != ?")
+		args = append(args, time.Now().Format(time.RFC3339), types.StatusClosed)
 	}
 
 	whereSQL := ""

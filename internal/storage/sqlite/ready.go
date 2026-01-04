@@ -41,7 +41,8 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 		// - gate: async wait conditions
 		// - molecule: workflow containers
 		// - message: mail/communication items
-		whereClauses = append(whereClauses, "i.issue_type NOT IN ('merge-request', 'gate', 'molecule', 'message')")
+		// - agent: identity/state tracking beads
+		whereClauses = append(whereClauses, "i.issue_type NOT IN ('merge-request', 'gate', 'molecule', 'message', 'agent')")
 	}
 
 	if filter.Priority != nil {
@@ -110,6 +111,13 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 	if filter.MolType != nil {
 		whereClauses = append(whereClauses, "i.mol_type = ?")
 		args = append(args, string(*filter.MolType))
+	}
+
+	// Time-based deferral filtering (GH#820)
+	// By default, exclude issues where defer_until is in the future.
+	// If IncludeDeferred is true, skip this filter to show deferred issues.
+	if !filter.IncludeDeferred {
+		whereClauses = append(whereClauses, "(i.defer_until IS NULL OR datetime(i.defer_until) <= datetime('now'))")
 	}
 
 	// Build WHERE clause properly
@@ -183,6 +191,10 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 // filterByExternalDeps removes issues that have unsatisfied external dependencies.
 // External deps have format: external:<project>:<capability>
 // They are satisfied when the target project has a closed issue with provides:<capability> label.
+//
+// Optimization: Collects all unique external refs across all issues, then checks
+// them in batch (one DB open per external project) rather than checking each
+// ref individually. This avoids O(N) DB opens when issues share external deps.
 func (s *SQLiteStorage) filterByExternalDeps(ctx context.Context, issues []*types.Issue) ([]*types.Issue, error) {
 	if len(issues) == 0 {
 		return issues, nil
@@ -205,12 +217,26 @@ func (s *SQLiteStorage) filterByExternalDeps(ctx context.Context, issues []*type
 		return issues, nil
 	}
 
-	// Check each external dep and build set of blocked issue IDs
+	// Collect all unique external refs across all issues
+	uniqueRefs := make(map[string]bool)
+	for _, deps := range externalDeps {
+		for _, dep := range deps {
+			uniqueRefs[dep] = true
+		}
+	}
+
+	// Check all refs in batch (grouped by project internally)
+	refList := make([]string, 0, len(uniqueRefs))
+	for ref := range uniqueRefs {
+		refList = append(refList, ref)
+	}
+	statuses := CheckExternalDeps(ctx, refList)
+
+	// Build set of blocked issue IDs using batch results
 	blockedIssues := make(map[string]bool)
 	for issueID, deps := range externalDeps {
 		for _, dep := range deps {
-			status := CheckExternalDep(ctx, dep)
-			if !status.Satisfied {
+			if status, ok := statuses[dep]; ok && !status.Satisfied {
 				blockedIssues[issueID] = true
 				break // One unsatisfied dep is enough to block
 			}

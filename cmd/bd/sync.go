@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
@@ -50,6 +51,7 @@ Use --merge to merge the sync branch back to main branch.`,
 		noGitHistory, _ := cmd.Flags().GetBool("no-git-history")
 		squash, _ := cmd.Flags().GetBool("squash")
 		checkIntegrity, _ := cmd.Flags().GetBool("check")
+		acceptRebase, _ := cmd.Flags().GetBool("accept-rebase")
 
 		// If --no-push not explicitly set, check no-push config
 		if !cmd.Flags().Changed("no-push") {
@@ -286,6 +288,11 @@ Use --merge to merge the sync branch back to main branch.`,
 					}
 				}
 
+				// Template validation before export (bd-t7jq)
+				if err := validateOpenIssuesForSync(ctx); err != nil {
+					FatalError("%v", err)
+				}
+
 				fmt.Println("→ Exporting pending changes to JSONL...")
 				if err := exportToJSONL(ctx, jsonlPath); err != nil {
 					FatalError("exporting: %v", err)
@@ -304,7 +311,12 @@ Use --merge to merge the sync branch back to main branch.`,
 		beadsDir := filepath.Dir(jsonlPath)
 		isExternal := isExternalBeadsDir(ctx, beadsDir)
 
-		if isExternal {
+		// GH#812/bd-n663: When sync.branch is configured, skip external direct-commit mode.
+		// The redirect may point to another clone/worktree in the same repo, but cross
+		// directory boundaries that trigger isExternalBeadsDir=true. When sync.branch is
+		// configured, we should use the sync.branch workflow which properly handles copying
+		// JSONL files to the sync branch worktree, regardless of where the source .beads lives.
+		if isExternal && !hasSyncBranchConfig {
 			// External BEADS_DIR: commit/pull directly to the beads repo
 			fmt.Println("→ External BEADS_DIR detected, using direct commit...")
 
@@ -371,10 +383,20 @@ Use --merge to merge the sync branch back to main branch.`,
 		var repoRoot string
 		var useSyncBranch bool
 		var onSyncBranch bool // GH#519: track if we're on the sync branch
+		// GH#872: Get configured remote from sync.remote (for fork workflows, etc.)
+		var configuredRemote string
 		if err := ensureStoreActive(); err == nil && store != nil {
+			// Read sync.remote config (e.g., "upstream" for fork workflows)
+			configuredRemote, _ = store.GetConfig(ctx, "sync.remote")
 			syncBranchName, _ = syncbranch.Get(ctx, store)
 			if syncBranchName != "" && syncbranch.HasGitRemote(ctx) {
-				repoRoot, err = syncbranch.GetRepoRoot(ctx)
+				// GH#829/bd-e2q9/bd-kvus: Get repo root from beads location, not cwd.
+				// When .beads/redirect exists, jsonlPath points to the redirected location
+				// (e.g., mayor/rig/.beads/issues.jsonl), but cwd is in a different repo
+				// (e.g., crew/gus). The worktree for sync-branch must be in the same
+				// repo as the beads directory.
+				beadsDir := filepath.Dir(jsonlPath)
+				repoRoot, err = getRepoRootFromPath(ctx, beadsDir)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: sync.branch configured but failed to get repo root: %v\n", err)
 					fmt.Fprintf(os.Stderr, "Falling back to current branch commits\n")
@@ -393,10 +415,102 @@ Use --merge to merge the sync branch back to main branch.`,
 			}
 		}
 
+		// Force-push detection for sync branch (bd-hlsw.4)
+		// Check if the remote sync branch was force-pushed since last sync
+		if useSyncBranch && !noPull && !dryRun {
+			forcePushStatus, err := syncbranch.CheckForcePush(ctx, store, repoRoot, syncBranchName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not check for force-push: %v\n", err)
+			} else if forcePushStatus.Detected {
+				fmt.Fprintf(os.Stderr, "\n⚠️  %s\n\n", forcePushStatus.Message)
+
+				if acceptRebase {
+					// User explicitly accepted the rebase via --accept-rebase flag
+					fmt.Println("→ --accept-rebase specified, resetting to remote state...")
+					if err := syncbranch.ResetToRemote(ctx, repoRoot, syncBranchName, jsonlPath); err != nil {
+						FatalError("failed to reset to remote: %v", err)
+					}
+					// Clear the stored SHA since we're resetting
+					if err := syncbranch.ClearStoredRemoteSHA(ctx, store); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to clear stored remote SHA: %v\n", err)
+					}
+					fmt.Println("✓ Reset to remote sync branch state")
+					fmt.Println("→ Re-importing JSONL after reset...")
+					if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
+						FatalError("importing after reset: %v", err)
+					}
+					fmt.Println("✓ Import complete after reset")
+
+					// Update stored SHA to current remote
+					if err := syncbranch.UpdateStoredRemoteSHA(ctx, store, repoRoot, syncBranchName); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to update stored remote SHA: %v\n", err)
+					}
+
+					fmt.Println("\n✓ Sync complete (reset to remote after force-push)")
+					return
+				}
+
+				// Prompt for confirmation
+				fmt.Fprintln(os.Stderr, "Options:")
+				fmt.Fprintln(os.Stderr, "  1. Reset to remote (discard local sync branch changes)")
+				fmt.Fprintln(os.Stderr, "  2. Abort sync (investigate manually)")
+				fmt.Fprintln(os.Stderr, "")
+				fmt.Fprintln(os.Stderr, "To reset automatically, run: bd sync --accept-rebase")
+				fmt.Fprintln(os.Stderr, "")
+				fmt.Fprint(os.Stderr, "Reset to remote state? [y/N]: ")
+
+				var response string
+				reader := bufio.NewReader(os.Stdin)
+				response, _ = reader.ReadString('\n')
+				response = strings.TrimSpace(strings.ToLower(response))
+
+				if response == "y" || response == "yes" {
+					fmt.Println("→ Resetting to remote state...")
+					if err := syncbranch.ResetToRemote(ctx, repoRoot, syncBranchName, jsonlPath); err != nil {
+						FatalError("failed to reset to remote: %v", err)
+					}
+					// Clear the stored SHA since we're resetting
+					if err := syncbranch.ClearStoredRemoteSHA(ctx, store); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to clear stored remote SHA: %v\n", err)
+					}
+					fmt.Println("✓ Reset to remote sync branch state")
+					fmt.Println("→ Re-importing JSONL after reset...")
+					if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
+						FatalError("importing after reset: %v", err)
+					}
+					fmt.Println("✓ Import complete after reset")
+
+					// Update stored SHA to current remote
+					if err := syncbranch.UpdateStoredRemoteSHA(ctx, store, repoRoot, syncBranchName); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to update stored remote SHA: %v\n", err)
+					}
+
+					fmt.Println("\n✓ Sync complete (reset to remote after force-push)")
+					return
+				}
+
+				// User chose to abort
+				FatalErrorWithHint("sync aborted due to force-push detection",
+					"investigate the sync branch history, then run 'bd sync --accept-rebase' to reset to remote")
+			}
+		}
+
 		// Step 2: Check if there are changes to commit (check entire .beads/ directory)
-		hasChanges, err := gitHasBeadsChanges(ctx)
-		if err != nil {
-			FatalError("checking git status: %v", err)
+		// GH#812: When using sync-branch, skip this check - CommitToSyncBranch handles it internally.
+		// The main repo's .beads may be gitignored on code branches (valid per #797/#801).
+		// In that case, gitHasBeadsChanges returns false even when JSONL has changes,
+		// because git doesn't track the files. CommitToSyncBranch copies files to the
+		// worktree where they ARE tracked (different gitignore) and checks there.
+		var hasChanges bool
+		var err error
+		if !useSyncBranch {
+			hasChanges, err = gitHasBeadsChanges(ctx)
+			if err != nil {
+				FatalError("checking git status: %v", err)
+			}
+		} else {
+			// Let CommitToSyncBranch determine if there are actual changes in the worktree
+			hasChanges = true
 		}
 
 		// Track if we already pushed via worktree (to skip Step 5)
@@ -425,6 +539,10 @@ Use --merge to merge the sync branch back to main branch.`,
 						fmt.Printf("✓ Pushed %s to remote\n", syncBranchName)
 						pushedViaSyncBranch = true
 					}
+				} else {
+					// GH#812: When useSyncBranch is true, we always attempt commit
+					// (bypassing gitHasBeadsChanges). Report when worktree has no changes.
+					fmt.Println("→ No changes to commit")
 				}
 			} else {
 				// Regular commit to current branch
@@ -516,12 +634,15 @@ Use --merge to merge the sync branch back to main branch.`,
 					checkMergeDriverConfig()
 
 					// GH#519: show appropriate message when on sync branch
+					// GH#872: show configured remote if using sync.remote
 					if onSyncBranch {
 						fmt.Printf("→ Pulling from remote on sync branch '%s'...\n", syncBranchName)
+					} else if configuredRemote != "" {
+						fmt.Printf("→ Pulling from %s...\n", configuredRemote)
 					} else {
 						fmt.Println("→ Pulling from remote...")
 					}
-					err := gitPull(ctx)
+					err := gitPull(ctx, configuredRemote)
 					if err != nil {
 						// Check if it's a rebase conflict on beads.jsonl that we can auto-resolve
 						if isInRebase() && hasJSONLConflict() {
@@ -676,12 +797,21 @@ Use --merge to merge the sync branch back to main branch.`,
 		// Step 5: Push to remote (skip if using sync branch - all pushes go via worktree)
 		// When sync.branch is configured, we don't push the main branch at all.
 		// The sync branch worktree handles all pushes.
+		// GH#872: Use sync.remote config if set
 		if !noPush && hasChanges && !pushedViaSyncBranch && !useSyncBranch {
 			if dryRun {
-				fmt.Println("→ [DRY RUN] Would push to remote")
+				if configuredRemote != "" {
+					fmt.Printf("→ [DRY RUN] Would push to %s\n", configuredRemote)
+				} else {
+					fmt.Println("→ [DRY RUN] Would push to remote")
+				}
 			} else {
-				fmt.Println("→ Pushing to remote...")
-				if err := gitPush(ctx); err != nil {
+				if configuredRemote != "" {
+					fmt.Printf("→ Pushing to %s...\n", configuredRemote)
+				} else {
+					fmt.Println("→ Pushing to remote...")
+				}
+				if err := gitPush(ctx, configuredRemote); err != nil {
 					FatalErrorWithHint(fmt.Sprintf("pushing: %v", err), "pull may have brought new changes, run 'bd sync' again")
 				}
 			}
@@ -706,6 +836,15 @@ Use --merge to merge the sync branch back to main branch.`,
 					// Non-fatal - just means git status will show modified files
 					debug.Logf("sync: failed to restore .beads/ from branch: %v", err)
 				}
+
+				// GH#870: Set git index flags to hide .beads/issues.jsonl from git status.
+				// This prevents the file from appearing modified on main when using sync-branch.
+				if cwd, err := os.Getwd(); err == nil {
+					if err := fix.SyncBranchGitignore(cwd); err != nil {
+						debug.Logf("sync: failed to set gitignore flags: %v", err)
+					}
+				}
+
 				// Skip final flush in PersistentPostRun - we've already exported to sync branch
 				// and restored the working directory to match the current branch
 				skipFinalFlush = true
@@ -714,6 +853,14 @@ Use --merge to merge the sync branch back to main branch.`,
 			// Clear sync state on successful sync (daemon backoff/hints)
 			if bd := beads.FindBeadsDir(); bd != "" {
 				_ = ClearSyncState(bd)
+			}
+
+			// Update stored remote SHA after successful sync (bd-hlsw.4)
+			// This enables force-push detection on subsequent syncs
+			if useSyncBranch && !noPush {
+				if err := syncbranch.UpdateStoredRemoteSHA(ctx, store, repoRoot, syncBranchName); err != nil {
+					debug.Logf("sync: failed to update stored remote SHA: %v", err)
+				}
 			}
 
 			fmt.Println("\n✓ Sync complete")
@@ -736,6 +883,7 @@ func init() {
 	syncCmd.Flags().Bool("no-git-history", false, "Skip git history backfill for deletions (use during JSONL filename migrations)")
 	syncCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output sync statistics in JSON format")
 	syncCmd.Flags().Bool("check", false, "Pre-sync integrity check: detect forced pushes, prefix mismatches, and orphaned issues")
+	syncCmd.Flags().Bool("accept-rebase", false, "Accept remote sync branch history (use when force-push detected)")
 	rootCmd.AddCommand(syncCmd)
 }
 

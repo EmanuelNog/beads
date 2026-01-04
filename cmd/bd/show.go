@@ -209,6 +209,9 @@ var showCmd = &cobra.Command{
 					if issue.CloseReason != "" {
 						fmt.Printf("Close reason: %s\n", issue.CloseReason)
 					}
+					if issue.ClosedBySession != "" {
+						fmt.Printf("Closed by session: %s\n", issue.ClosedBySession)
+					}
 					fmt.Printf("Priority: P%d\n", issue.Priority)
 					fmt.Printf("Type: %s\n", issue.IssueType)
 					if issue.Assignee != "" {
@@ -222,6 +225,12 @@ var showCmd = &cobra.Command{
 						fmt.Printf("Created by: %s\n", issue.CreatedBy)
 					}
 					fmt.Printf("Updated: %s\n", issue.UpdatedAt.Format("2006-01-02 15:04"))
+					if issue.DueAt != nil {
+						fmt.Printf("Due: %s\n", issue.DueAt.Format("2006-01-02 15:04"))
+					}
+					if issue.DeferUntil != nil {
+						fmt.Printf("Deferred until: %s\n", issue.DeferUntil.Format("2006-01-02 15:04"))
+					}
 
 					// Show compaction status
 					if issue.CompactionLevel > 0 {
@@ -332,6 +341,13 @@ var showCmd = &cobra.Command{
 			if jsonOutput && len(allDetails) > 0 {
 				outputJSON(allDetails)
 			}
+
+			// Track first shown issue as last touched
+			if len(resolvedIDs) > 0 {
+				SetLastTouchedID(resolvedIDs[0])
+			} else if len(routedArgs) > 0 {
+				SetLastTouchedID(routedArgs[0])
+			}
 			return
 		}
 
@@ -419,6 +435,9 @@ var showCmd = &cobra.Command{
 			if issue.CloseReason != "" {
 				fmt.Printf("Close reason: %s\n", issue.CloseReason)
 			}
+			if issue.ClosedBySession != "" {
+				fmt.Printf("Closed by session: %s\n", issue.ClosedBySession)
+			}
 			fmt.Printf("Priority: P%d\n", issue.Priority)
 			fmt.Printf("Type: %s\n", issue.IssueType)
 			if issue.Assignee != "" {
@@ -432,6 +451,12 @@ var showCmd = &cobra.Command{
 				fmt.Printf("Created by: %s\n", issue.CreatedBy)
 			}
 			fmt.Printf("Updated: %s\n", issue.UpdatedAt.Format("2006-01-02 15:04"))
+			if issue.DueAt != nil {
+				fmt.Printf("Due: %s\n", issue.DueAt.Format("2006-01-02 15:04"))
+			}
+			if issue.DeferUntil != nil {
+				fmt.Printf("Deferred until: %s\n", issue.DeferUntil.Format("2006-01-02 15:04"))
+			}
 
 			// Show compaction status footer
 			if issue.CompactionLevel > 0 {
@@ -563,6 +588,11 @@ var showCmd = &cobra.Command{
 		} else if len(allDetails) > 0 {
 			// Show tip after successful show (non-JSON mode)
 			maybeShowTip(store)
+		}
+
+		// Track first shown issue as last touched
+		if len(args) > 0 {
+			SetLastTouchedID(args[0])
 		}
 	},
 }

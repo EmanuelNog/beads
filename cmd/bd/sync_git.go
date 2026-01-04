@@ -89,6 +89,7 @@ func getRepoRootForWorktree(_ context.Context) string {
 }
 
 // gitHasBeadsChanges checks if any tracked files in .beads/ have uncommitted changes
+// This function is worktree-aware and handles bare repo worktree setups (GH#827).
 func gitHasBeadsChanges(ctx context.Context) (bool, error) {
 	// Get the absolute path to .beads directory
 	beadsDir := beads.FindBeadsDir()
@@ -96,26 +97,12 @@ func gitHasBeadsChanges(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("no .beads directory found")
 	}
 
-	// Get the repository root (handles worktrees properly)
-	repoRoot := getRepoRootForWorktree(ctx)
-	if repoRoot == "" {
-		return false, fmt.Errorf("cannot determine repository root")
-	}
-
-	// Compute relative path from repo root to .beads
-	relPath, err := filepath.Rel(repoRoot, beadsDir)
-	if err != nil {
-		// Fall back to absolute path if relative path fails
-		statusCmd := exec.CommandContext(ctx, "git", "status", "--porcelain", beadsDir) //nolint:gosec // G204: beadsDir from beads.FindBeadsDir()
-		statusOutput, err := statusCmd.Output()
-		if err != nil {
-			return false, fmt.Errorf("git status failed: %w", err)
-		}
-		return len(strings.TrimSpace(string(statusOutput))) > 0, nil
-	}
-
-	// Run git status with relative path from repo root
-	statusCmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "status", "--porcelain", relPath) //nolint:gosec // G204: paths from internal git helpers
+	// Run git status with absolute path from current directory.
+	// This is more robust than using -C with a repo root, because:
+	// 1. In bare repo worktree setups, GetMainRepoRoot() returns the parent
+	//    of the bare repo, which isn't a valid working tree (GH#827)
+	// 2. Git will find the repository from cwd, which is always valid
+	statusCmd := exec.CommandContext(ctx, "git", "status", "--porcelain", beadsDir) //nolint:gosec // G204: beadsDir from beads.FindBeadsDir()
 	statusOutput, err := statusCmd.Output()
 	if err != nil {
 		return false, fmt.Errorf("git status failed: %w", err)
@@ -340,6 +327,85 @@ func runGitRebaseContinue(ctx context.Context) error {
 
 // gitPull pulls from the current branch's upstream
 // Returns nil if no remote configured (local-only mode)
+// If configuredRemote is non-empty, uses that instead of the branch's configured remote.
+// This allows respecting the sync.remote bd config.
+func gitPull(ctx context.Context, configuredRemote string) error {
+	// Check if any remote exists (support local-only repos)
+	if !hasGitRemote(ctx) {
+		return nil // Gracefully skip - local-only mode
+	}
+
+	// Get current branch name
+	// Use symbolic-ref to work in fresh repos without commits
+	branchCmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
+	branchOutput, err := branchCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get current branch: %w", err)
+	}
+	branch := strings.TrimSpace(string(branchOutput))
+
+	// Determine remote to use:
+	// 1. If configuredRemote (from sync.remote bd config) is set, use that
+	// 2. Otherwise, get from git branch tracking config
+	// 3. Fall back to "origin"
+	remote := configuredRemote
+	if remote == "" {
+		remoteCmd := exec.CommandContext(ctx, "git", "config", "--get", fmt.Sprintf("branch.%s.remote", branch)) //nolint:gosec // G204: branch from git symbolic-ref
+		remoteOutput, err := remoteCmd.Output()
+		if err != nil {
+			// If no remote configured, default to "origin"
+			remote = "origin"
+		} else {
+			remote = strings.TrimSpace(string(remoteOutput))
+		}
+	}
+
+	// Pull with explicit remote and branch
+	cmd := exec.CommandContext(ctx, "git", "pull", remote, branch) //nolint:gosec // G204: remote/branch from git config, not user input
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git pull failed: %w\n%s", err, output)
+	}
+	return nil
+}
+
+// gitPush pushes to the current branch's upstream
+// Returns nil if no remote configured (local-only mode)
+// If configuredRemote is non-empty, pushes to that remote explicitly.
+// This allows respecting the sync.remote bd config.
+func gitPush(ctx context.Context, configuredRemote string) error {
+	// Check if any remote exists (support local-only repos)
+	if !hasGitRemote(ctx) {
+		return nil // Gracefully skip - local-only mode
+	}
+
+	// If configuredRemote is set, push explicitly to that remote with current branch
+	if configuredRemote != "" {
+		// Get current branch name
+		branchCmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
+		branchOutput, err := branchCmd.Output()
+		if err != nil {
+			return fmt.Errorf("failed to get current branch: %w", err)
+		}
+		branch := strings.TrimSpace(string(branchOutput))
+
+		cmd := exec.CommandContext(ctx, "git", "push", configuredRemote, branch) //nolint:gosec // G204: configuredRemote from bd config
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git push failed: %w\n%s", err, output)
+		}
+		return nil
+	}
+
+	// Default: use git's default push behavior
+	cmd := exec.CommandContext(ctx, "git", "push")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git push failed: %w\n%s", err, output)
+	}
+	return nil
+}
+
 func checkMergeDriverConfig() {
 	// Get current merge driver configuration
 	cmd := exec.Command("git", "config", "merge.beads.driver")
@@ -360,55 +426,6 @@ func checkMergeDriverConfig() {
 		fmt.Fprintf(os.Stderr, "\n   Fix now: bd doctor --fix\n")
 		fmt.Fprintf(os.Stderr, "   Or manually: git config merge.beads.driver \"bd merge %%A %%O %%A %%B\"\n\n")
 	}
-}
-
-func gitPull(ctx context.Context) error {
-	// Check if any remote exists (support local-only repos)
-	if !hasGitRemote(ctx) {
-		return nil // Gracefully skip - local-only mode
-	}
-
-	// Get current branch name
-	// Use symbolic-ref to work in fresh repos without commits
-	branchCmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
-	branchOutput, err := branchCmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to get current branch: %w", err)
-	}
-	branch := strings.TrimSpace(string(branchOutput))
-
-	// Get remote name for current branch (usually "origin")
-	remoteCmd := exec.CommandContext(ctx, "git", "config", "--get", fmt.Sprintf("branch.%s.remote", branch)) //nolint:gosec // G204: branch from git symbolic-ref
-	remoteOutput, err := remoteCmd.Output()
-	if err != nil {
-		// If no remote configured, default to "origin"
-		remoteOutput = []byte("origin\n")
-	}
-	remote := strings.TrimSpace(string(remoteOutput))
-
-	// Pull with explicit remote and branch
-	cmd := exec.CommandContext(ctx, "git", "pull", remote, branch) //nolint:gosec // G204: remote/branch from git config, not user input
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git pull failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// gitPush pushes to the current branch's upstream
-// Returns nil if no remote configured (local-only mode)
-func gitPush(ctx context.Context) error {
-	// Check if any remote exists (support local-only repos)
-	if !hasGitRemote(ctx) {
-		return nil // Gracefully skip - local-only mode
-	}
-
-	cmd := exec.CommandContext(ctx, "git", "push")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git push failed: %w\n%s", err, output)
-	}
-	return nil
 }
 
 // restoreBeadsDirFromBranch restores .beads/ directory from the current branch's committed state.

@@ -38,8 +38,8 @@ var YamlOnlyKeys = map[string]bool{
 	// Git settings
 	"git.author":       true,
 	"git.no-gpg-sign":  true,
-	"no-push":          true,
-	"no-git-ops":       true, // Disable git ops in bd prime session close protocol (GH#593)
+	"no-push":    true,
+	"no-git-ops": true, // Disable git ops in bd prime session close protocol (GH#593)
 
 	// Sync settings
 	"sync-branch":                           true,
@@ -54,6 +54,11 @@ var YamlOnlyKeys = map[string]bool{
 
 	// Create command settings
 	"create.require-description": true,
+
+	// Validation settings (bd-t7jq)
+	// Values: "warn" | "error" | "none"
+	"validation.on-create": true,
+	"validation.on-sync":   true,
 }
 
 // IsYamlOnlyKey returns true if the given key should be stored in config.yaml
@@ -65,7 +70,7 @@ func IsYamlOnlyKey(key string) bool {
 	}
 
 	// Check prefix matches for nested keys
-	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects."}
+	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects.", "validation."}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(key, prefix) {
 			return true
@@ -125,11 +130,13 @@ func SetYamlConfig(key, value string) error {
 
 // GetYamlConfig gets a configuration value from config.yaml.
 // Returns empty string if key is not found or is commented out.
+// Keys are normalized to their canonical yaml format (e.g., sync.branch -> sync-branch).
 func GetYamlConfig(key string) string {
 	if v == nil {
 		return ""
 	}
-	return v.GetString(key)
+	normalizedKey := normalizeYamlKey(key)
+	return v.GetString(normalizedKey)
 }
 
 // findProjectConfigYaml finds the project's .beads/config.yaml file.
