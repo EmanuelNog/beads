@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 
@@ -437,8 +436,9 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 	// Type assert to SQLite storage
 	d, ok := store.(*sqlite.SQLiteStorage)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: batch delete not supported by this storage backend\n")
-		os.Exit(1)
+		// Fallback for non-SQLite storage (e.g., MemoryStorage in --no-db mode)
+		deleteBatchFallback(issueIDs, force, dryRun, cascade, jsonOutput, hardDelete, reason)
+		return
 	}
 	// Verify all issues exist
 	issues := make(map[string]*types.Issue)
@@ -566,6 +566,144 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 		}
 	}
 }
+
+// deleteBatchFallback handles batch deletion for non-SQLite storage (e.g., MemoryStorage in --no-db mode)
+// It iterates through issues one by one, creating tombstones for each.
+func deleteBatchFallback(issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, hardDelete bool, reason string) {
+	ctx := rootCtx
+
+	// Cascade not supported in fallback mode
+	if cascade {
+		fmt.Fprintf(os.Stderr, "Error: --cascade not supported in --no-db mode\n")
+		os.Exit(1)
+	}
+
+	// Verify all issues exist first
+	issues := make(map[string]*types.Issue)
+	notFound := []string{}
+	for _, id := range issueIDs {
+		issue, err := store.GetIssue(ctx, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting issue %s: %v\n", id, err)
+			os.Exit(1)
+		}
+		if issue == nil {
+			notFound = append(notFound, id)
+		} else {
+			issues[id] = issue
+		}
+	}
+	if len(notFound) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: issues not found: %s\n", strings.Join(notFound, ", "))
+		os.Exit(1)
+	}
+
+	// Preview mode
+	if dryRun || !force {
+		fmt.Printf("\n%s\n", ui.RenderFail("⚠️  DELETE PREVIEW"))
+		fmt.Printf("\nIssues to delete (%d):\n", len(issueIDs))
+		for _, id := range issueIDs {
+			if issue := issues[id]; issue != nil {
+				fmt.Printf("  %s: %s\n", id, issue.Title)
+			}
+		}
+		if dryRun {
+			fmt.Printf("\n(Dry-run mode - no changes made)\n")
+		} else {
+			fmt.Printf("\n%s\n", ui.RenderWarn("This operation cannot be undone!"))
+			fmt.Printf("To proceed, run: %s\n",
+				ui.RenderWarn("bd delete "+strings.Join(issueIDs, " ")+" --force"))
+		}
+		return
+	}
+
+	// Pre-collect connected issues before deletion (for text reference updates)
+	connectedIssues := make(map[string]*types.Issue)
+	idSet := make(map[string]bool)
+	for _, id := range issueIDs {
+		idSet[id] = true
+	}
+	for _, id := range issueIDs {
+		deps, err := store.GetDependencies(ctx, id)
+		if err == nil {
+			for _, dep := range deps {
+				if !idSet[dep.ID] {
+					connectedIssues[dep.ID] = dep
+				}
+			}
+		}
+		dependents, err := store.GetDependents(ctx, id)
+		if err == nil {
+			for _, dep := range dependents {
+				if !idSet[dep.ID] {
+					connectedIssues[dep.ID] = dep
+				}
+			}
+		}
+	}
+
+	// Delete each issue
+	deleteActor := getActorWithGit()
+	deletedCount := 0
+	depsRemoved := 0
+
+	for _, issueID := range issueIDs {
+		// Remove dependencies (outgoing)
+		depRecords, err := store.GetDependencyRecords(ctx, issueID)
+		if err == nil {
+			for _, dep := range depRecords {
+				if err := store.RemoveDependency(ctx, dep.IssueID, dep.DependsOnID, deleteActor); err == nil {
+					depsRemoved++
+				}
+			}
+		}
+
+		// Remove dependencies (inbound)
+		dependents, err := store.GetDependents(ctx, issueID)
+		if err == nil {
+			for _, dep := range dependents {
+				if err := store.RemoveDependency(ctx, dep.ID, issueID, deleteActor); err == nil {
+					depsRemoved++
+				}
+			}
+		}
+
+		// Create tombstone
+		if err := createTombstone(ctx, issueID, deleteActor, reason); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating tombstone for %s: %v\n", issueID, err)
+			continue
+		}
+		deletedCount++
+	}
+
+	// Update text references in connected issues
+	updatedCount := updateTextReferencesInIssues(ctx, issueIDs, connectedIssues)
+
+	// Hard delete: remove from JSONL immediately
+	if hardDelete {
+		for _, id := range issueIDs {
+			_ = removeIssueFromJSONL(id)
+		}
+	}
+
+	// Schedule auto-flush
+	markDirtyAndScheduleFlush()
+
+	// Output results
+	if jsonOutput {
+		outputJSON(map[string]interface{}{
+			"deleted":              issueIDs,
+			"deleted_count":        deletedCount,
+			"dependencies_removed": depsRemoved,
+			"references_updated":   updatedCount,
+		})
+	} else {
+		fmt.Printf("%s Deleted %d issue(s)\n", ui.RenderPass("✓"), deletedCount)
+		fmt.Printf("  Removed %d dependency link(s)\n", depsRemoved)
+		fmt.Printf("  Updated text references in %d issue(s)\n", updatedCount)
+	}
+}
+
 // showDeletionPreview shows what would be deleted
 func showDeletionPreview(issueIDs []string, issues map[string]*types.Issue, cascade bool, depError error) {
 	fmt.Printf("\n%s\n", ui.RenderFail("⚠️  DELETE PREVIEW"))
@@ -663,30 +801,6 @@ func uniqueStrings(slice []string) []string {
 	return result
 }
 
-// getActorWithGit returns the actor for audit trail with git config fallback.
-// Priority: global actor var (from --actor flag or BD_ACTOR env) > git config user.name > $USER > "unknown"
-func getActorWithGit() string {
-	// If actor is already set (from flag or env), use it
-	if actor != "" && actor != "unknown" {
-		return actor
-	}
-
-	// Try git config user.name
-	cmd := exec.Command("git", "config", "user.name")
-	if output, err := cmd.Output(); err == nil {
-		if gitUser := strings.TrimSpace(string(output)); gitUser != "" {
-			return gitUser
-		}
-	}
-
-	// Fall back to USER env
-	if user := os.Getenv("USER"); user != "" {
-		return user
-	}
-
-	return "unknown"
-}
-
 func init() {
 	deleteCmd.Flags().BoolP("force", "f", false, "Actually delete (without this flag, shows preview)")
 	deleteCmd.Flags().String("from-file", "", "Read issue IDs from file (one per line)")
@@ -694,5 +808,6 @@ func init() {
 	deleteCmd.Flags().Bool("cascade", false, "Recursively delete all dependent issues")
 	deleteCmd.Flags().Bool("hard", false, "Permanently delete (skip tombstone, cannot be recovered via sync)")
 	deleteCmd.Flags().String("reason", "", "Reason for deletion (stored in tombstone for audit trail)")
+	deleteCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(deleteCmd)
 }

@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -1051,5 +1052,408 @@ func TestHandleDelete_CascadeAndForceFlags(t *testing.T) {
 
 	if deletedCount, ok := result["deleted_count"].(float64); !ok || int(deletedCount) != 1 {
 		t.Errorf("expected deleted_count=1, got %v", result["deleted_count"])
+	}
+}
+
+// TestHandleUpdate_ClaimFlag verifies atomic claim operation (gt-il2p7)
+func TestHandleUpdate_ClaimFlag(t *testing.T) {
+	store := memory.New("/tmp/test.jsonl")
+	server := NewServer("/tmp/test.sock", store, "/tmp", "/tmp/test.db")
+
+	// Create an issue first
+	createArgs := CreateArgs{
+		Title:     "Test Issue for Claim",
+		IssueType: "task",
+		Priority:  2,
+	}
+	createJSON, _ := json.Marshal(createArgs)
+	createReq := &Request{
+		Operation: OpCreate,
+		Args:      createJSON,
+		Actor:     "test-user",
+	}
+
+	createResp := server.handleCreate(createReq)
+	if !createResp.Success {
+		t.Fatalf("failed to create test issue: %s", createResp.Error)
+	}
+
+	var createdIssue types.Issue
+	if err := json.Unmarshal(createResp.Data, &createdIssue); err != nil {
+		t.Fatalf("failed to parse created issue: %v", err)
+	}
+	issueID := createdIssue.ID
+
+	// Verify issue starts with no assignee
+	if createdIssue.Assignee != "" {
+		t.Fatalf("expected no assignee initially, got %s", createdIssue.Assignee)
+	}
+
+	// Claim the issue
+	updateArgs := UpdateArgs{
+		ID:    issueID,
+		Claim: true,
+	}
+	updateJSON, _ := json.Marshal(updateArgs)
+	updateReq := &Request{
+		Operation: OpUpdate,
+		Args:      updateJSON,
+		Actor:     "claiming-agent",
+	}
+
+	updateResp := server.handleUpdate(updateReq)
+	if !updateResp.Success {
+		t.Fatalf("claim operation failed: %s", updateResp.Error)
+	}
+
+	// Verify issue was claimed
+	var updatedIssue types.Issue
+	if err := json.Unmarshal(updateResp.Data, &updatedIssue); err != nil {
+		t.Fatalf("failed to parse updated issue: %v", err)
+	}
+
+	if updatedIssue.Assignee != "claiming-agent" {
+		t.Errorf("expected assignee 'claiming-agent', got %s", updatedIssue.Assignee)
+	}
+	if updatedIssue.Status != "in_progress" {
+		t.Errorf("expected status 'in_progress', got %s", updatedIssue.Status)
+	}
+}
+
+// TestHandleUpdate_ClaimFlag_AlreadyClaimed verifies double-claim returns error
+func TestHandleUpdate_ClaimFlag_AlreadyClaimed(t *testing.T) {
+	store := memory.New("/tmp/test.jsonl")
+	server := NewServer("/tmp/test.sock", store, "/tmp", "/tmp/test.db")
+
+	// Create an issue first
+	createArgs := CreateArgs{
+		Title:     "Test Issue for Double Claim",
+		IssueType: "task",
+		Priority:  2,
+	}
+	createJSON, _ := json.Marshal(createArgs)
+	createReq := &Request{
+		Operation: OpCreate,
+		Args:      createJSON,
+		Actor:     "test-user",
+	}
+
+	createResp := server.handleCreate(createReq)
+	if !createResp.Success {
+		t.Fatalf("failed to create test issue: %s", createResp.Error)
+	}
+
+	var createdIssue types.Issue
+	if err := json.Unmarshal(createResp.Data, &createdIssue); err != nil {
+		t.Fatalf("failed to parse created issue: %v", err)
+	}
+	issueID := createdIssue.ID
+
+	// First claim should succeed
+	updateArgs := UpdateArgs{
+		ID:    issueID,
+		Claim: true,
+	}
+	updateJSON, _ := json.Marshal(updateArgs)
+	updateReq := &Request{
+		Operation: OpUpdate,
+		Args:      updateJSON,
+		Actor:     "first-claimer",
+	}
+
+	updateResp := server.handleUpdate(updateReq)
+	if !updateResp.Success {
+		t.Fatalf("first claim should succeed: %s", updateResp.Error)
+	}
+
+	// Second claim should fail
+	updateArgs2 := UpdateArgs{
+		ID:    issueID,
+		Claim: true,
+	}
+	updateJSON2, _ := json.Marshal(updateArgs2)
+	updateReq2 := &Request{
+		Operation: OpUpdate,
+		Args:      updateJSON2,
+		Actor:     "second-claimer",
+	}
+
+	updateResp2 := server.handleUpdate(updateReq2)
+	if updateResp2.Success {
+		t.Error("expected second claim to fail, but it succeeded")
+	}
+
+	// Verify error message
+	expectedError := "already claimed by first-claimer"
+	if updateResp2.Error != expectedError {
+		t.Errorf("expected error %q, got %q", expectedError, updateResp2.Error)
+	}
+}
+
+// TestHandleUpdate_ClaimFlag_WithOtherUpdates verifies claim can combine with other updates
+func TestHandleUpdate_ClaimFlag_WithOtherUpdates(t *testing.T) {
+	store := memory.New("/tmp/test.jsonl")
+	server := NewServer("/tmp/test.sock", store, "/tmp", "/tmp/test.db")
+
+	// Create an issue first
+	createArgs := CreateArgs{
+		Title:     "Test Issue for Claim with Updates",
+		IssueType: "task",
+		Priority:  2,
+	}
+	createJSON, _ := json.Marshal(createArgs)
+	createReq := &Request{
+		Operation: OpCreate,
+		Args:      createJSON,
+		Actor:     "test-user",
+	}
+
+	createResp := server.handleCreate(createReq)
+	if !createResp.Success {
+		t.Fatalf("failed to create test issue: %s", createResp.Error)
+	}
+
+	var createdIssue types.Issue
+	if err := json.Unmarshal(createResp.Data, &createdIssue); err != nil {
+		t.Fatalf("failed to parse created issue: %v", err)
+	}
+	issueID := createdIssue.ID
+
+	// Claim and update priority at the same time
+	priority := 0 // High priority
+	updateArgs := UpdateArgs{
+		ID:       issueID,
+		Claim:    true,
+		Priority: &priority,
+	}
+	updateJSON, _ := json.Marshal(updateArgs)
+	updateReq := &Request{
+		Operation: OpUpdate,
+		Args:      updateJSON,
+		Actor:     "claiming-agent",
+	}
+
+	updateResp := server.handleUpdate(updateReq)
+	if !updateResp.Success {
+		t.Fatalf("claim with updates failed: %s", updateResp.Error)
+	}
+
+	// Verify all updates were applied
+	ctx := context.Background()
+	issue, err := store.GetIssue(ctx, issueID)
+	if err != nil {
+		t.Fatalf("failed to get issue: %v", err)
+	}
+
+	if issue.Assignee != "claiming-agent" {
+		t.Errorf("expected assignee 'claiming-agent', got %s", issue.Assignee)
+	}
+	if issue.Status != "in_progress" {
+		t.Errorf("expected status 'in_progress', got %s", issue.Status)
+	}
+	if issue.Priority != 0 {
+		t.Errorf("expected priority 0, got %d", issue.Priority)
+	}
+}
+
+// TestHandleClose_BlockerCheck verifies that close operation checks for open blockers (GH#962)
+func TestHandleClose_BlockerCheck(t *testing.T) {
+	store := memory.New("/tmp/test.jsonl")
+	server := NewServer("/tmp/test.sock", store, "/tmp", "/tmp/test.db")
+	ctx := context.Background()
+
+	// Create two issues: blocker and blocked
+	blockerArgs := CreateArgs{
+		Title:     "Blocker Issue",
+		IssueType: "bug",
+		Priority:  1,
+	}
+	blockerJSON, _ := json.Marshal(blockerArgs)
+	blockerReq := &Request{
+		Operation: OpCreate,
+		Args:      blockerJSON,
+		Actor:     "test-user",
+	}
+
+	blockerResp := server.handleCreate(blockerReq)
+	if !blockerResp.Success {
+		t.Fatalf("failed to create blocker issue: %s", blockerResp.Error)
+	}
+
+	var blockerIssue types.Issue
+	if err := json.Unmarshal(blockerResp.Data, &blockerIssue); err != nil {
+		t.Fatalf("failed to parse blocker issue: %v", err)
+	}
+
+	blockedArgs := CreateArgs{
+		Title:     "Blocked Issue",
+		IssueType: "task",
+		Priority:  2,
+	}
+	blockedJSON, _ := json.Marshal(blockedArgs)
+	blockedReq := &Request{
+		Operation: OpCreate,
+		Args:      blockedJSON,
+		Actor:     "test-user",
+	}
+
+	blockedResp := server.handleCreate(blockedReq)
+	if !blockedResp.Success {
+		t.Fatalf("failed to create blocked issue: %s", blockedResp.Error)
+	}
+
+	var blockedIssue types.Issue
+	if err := json.Unmarshal(blockedResp.Data, &blockedIssue); err != nil {
+		t.Fatalf("failed to parse blocked issue: %v", err)
+	}
+
+	// Add dependency: blockedIssue depends on blockerIssue (blockerIssue blocks blockedIssue)
+	dep := &types.Dependency{
+		IssueID:     blockedIssue.ID,
+		DependsOnID: blockerIssue.ID,
+		Type:        types.DepBlocks,
+	}
+	if err := store.AddDependency(ctx, dep, "test-user"); err != nil {
+		t.Fatalf("failed to add dependency: %v", err)
+	}
+
+	// Try to close the blocked issue - should FAIL
+	closeArgs := CloseArgs{
+		ID:     blockedIssue.ID,
+		Reason: "attempting to close blocked issue",
+	}
+	closeJSON, _ := json.Marshal(closeArgs)
+	closeReq := &Request{
+		Operation: OpClose,
+		Args:      closeJSON,
+		Actor:     "test-user",
+	}
+
+	closeResp := server.handleClose(closeReq)
+	if closeResp.Success {
+		t.Error("expected close to fail for blocked issue, but it succeeded")
+	}
+
+	// Verify error message mentions blockers
+	if closeResp.Error == "" {
+		t.Error("expected error message about blockers")
+	}
+	_ = "cannot close " + blockedIssue.ID + ": blocked by open issues" // expectedError
+	if !strings.Contains(closeResp.Error, "blocked by open issues") {
+		t.Errorf("expected error to mention 'blocked by open issues', got: %s", closeResp.Error)
+	}
+
+	// Try to close with --force flag - should SUCCEED
+	forceCloseArgs := CloseArgs{
+		ID:     blockedIssue.ID,
+		Reason: "force closing blocked issue",
+		Force:  true,
+	}
+	forceCloseJSON, _ := json.Marshal(forceCloseArgs)
+	forceCloseReq := &Request{
+		Operation: OpClose,
+		Args:      forceCloseJSON,
+		Actor:     "test-user",
+	}
+
+	forceCloseResp := server.handleClose(forceCloseReq)
+	if !forceCloseResp.Success {
+		t.Errorf("expected force close to succeed, but got error: %s", forceCloseResp.Error)
+	}
+}
+
+// TestHandleClose_BlockerCheck_ClosedBlocker verifies close succeeds when blocker is closed (GH#962)
+func TestHandleClose_BlockerCheck_ClosedBlocker(t *testing.T) {
+	store := memory.New("/tmp/test.jsonl")
+	server := NewServer("/tmp/test.sock", store, "/tmp", "/tmp/test.db")
+	ctx := context.Background()
+
+	// Create two issues
+	blockerArgs := CreateArgs{
+		Title:     "Blocker That Will Be Closed",
+		IssueType: "bug",
+		Priority:  1,
+	}
+	blockerJSON, _ := json.Marshal(blockerArgs)
+	blockerReq := &Request{
+		Operation: OpCreate,
+		Args:      blockerJSON,
+		Actor:     "test-user",
+	}
+
+	blockerResp := server.handleCreate(blockerReq)
+	if !blockerResp.Success {
+		t.Fatalf("failed to create blocker issue: %s", blockerResp.Error)
+	}
+
+	var blockerIssue types.Issue
+	if err := json.Unmarshal(blockerResp.Data, &blockerIssue); err != nil {
+		t.Fatalf("failed to parse blocker issue: %v", err)
+	}
+
+	blockedArgs := CreateArgs{
+		Title:     "Issue That Can Be Closed After Blocker",
+		IssueType: "task",
+		Priority:  2,
+	}
+	blockedJSON, _ := json.Marshal(blockedArgs)
+	blockedReq := &Request{
+		Operation: OpCreate,
+		Args:      blockedJSON,
+		Actor:     "test-user",
+	}
+
+	blockedResp := server.handleCreate(blockedReq)
+	if !blockedResp.Success {
+		t.Fatalf("failed to create blocked issue: %s", blockedResp.Error)
+	}
+
+	var blockedIssue types.Issue
+	if err := json.Unmarshal(blockedResp.Data, &blockedIssue); err != nil {
+		t.Fatalf("failed to parse blocked issue: %v", err)
+	}
+
+	// Add dependency
+	dep := &types.Dependency{
+		IssueID:     blockedIssue.ID,
+		DependsOnID: blockerIssue.ID,
+		Type:        types.DepBlocks,
+	}
+	if err := store.AddDependency(ctx, dep, "test-user"); err != nil {
+		t.Fatalf("failed to add dependency: %v", err)
+	}
+
+	// First close the blocker
+	closeBlockerArgs := CloseArgs{
+		ID:     blockerIssue.ID,
+		Reason: "blocker fixed",
+	}
+	closeBlockerJSON, _ := json.Marshal(closeBlockerArgs)
+	closeBlockerReq := &Request{
+		Operation: OpClose,
+		Args:      closeBlockerJSON,
+		Actor:     "test-user",
+	}
+
+	closeBlockerResp := server.handleClose(closeBlockerReq)
+	if !closeBlockerResp.Success {
+		t.Fatalf("failed to close blocker: %s", closeBlockerResp.Error)
+	}
+
+	// Now close the blocked issue - should SUCCEED because blocker is closed
+	closeBlockedArgs := CloseArgs{
+		ID:     blockedIssue.ID,
+		Reason: "now unblocked",
+	}
+	closeBlockedJSON, _ := json.Marshal(closeBlockedArgs)
+	closeBlockedReq := &Request{
+		Operation: OpClose,
+		Args:      closeBlockedJSON,
+		Actor:     "test-user",
+	}
+
+	closeBlockedResp := server.handleClose(closeBlockedReq)
+	if !closeBlockedResp.Success {
+		t.Errorf("expected close to succeed after blocker was closed, got error: %s", closeBlockedResp.Error)
 	}
 }

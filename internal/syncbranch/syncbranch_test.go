@@ -3,6 +3,8 @@ package syncbranch
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/storage/sqlite"
@@ -216,10 +218,109 @@ func TestSet(t *testing.T) {
 	t.Run("rejects invalid branch name", func(t *testing.T) {
 		store := newTestStore(t)
 		defer store.Close()
-		
+
 		err := Set(ctx, store, "invalid..branch")
 		if err == nil {
 			t.Error("Set() expected error for invalid branch name, got nil")
+		}
+	})
+
+	// GH#807: Verify Set() rejects main/master (not just ValidateSyncBranchName)
+	t.Run("rejects main as sync branch", func(t *testing.T) {
+		store := newTestStore(t)
+		defer store.Close()
+
+		err := Set(ctx, store, "main")
+		if err == nil {
+			t.Error("Set() expected error for 'main', got nil")
+		}
+		if err != nil && !strings.Contains(err.Error(), "cannot use 'main'") {
+			t.Errorf("Set() error should mention 'cannot use main', got: %v", err)
+		}
+	})
+
+	t.Run("rejects master as sync branch", func(t *testing.T) {
+		store := newTestStore(t)
+		defer store.Close()
+
+		err := Set(ctx, store, "master")
+		if err == nil {
+			t.Error("Set() expected error for 'master', got nil")
+		}
+		if err != nil && !strings.Contains(err.Error(), "cannot use 'master'") {
+			t.Errorf("Set() error should mention 'cannot use master', got: %v", err)
+		}
+	})
+}
+
+// TestSetUpdatesConfigYAML verifies GH#909 fix: Set() writes to config.yaml
+func TestSetUpdatesConfigYAML(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("updates config.yaml when it exists", func(t *testing.T) {
+		// Create temp directory with .beads/config.yaml
+		tmpDir, err := os.MkdirTemp("", "test-syncbranch-yaml-*")
+		if err != nil {
+			t.Fatalf("Failed to create temp dir: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		beadsDir := tmpDir + "/.beads"
+		if err := os.MkdirAll(beadsDir, 0750); err != nil {
+			t.Fatalf("Failed to create .beads dir: %v", err)
+		}
+
+		// Create initial config.yaml with sync-branch commented out
+		configPath := beadsDir + "/config.yaml"
+		initialConfig := `# beads configuration
+# sync-branch: ""
+auto-start-daemon: true
+`
+		if err := os.WriteFile(configPath, []byte(initialConfig), 0600); err != nil {
+			t.Fatalf("Failed to create config.yaml: %v", err)
+		}
+
+		// Change to temp dir so findProjectConfigYaml can find it
+		origWd, _ := os.Getwd()
+		if err := os.Chdir(tmpDir); err != nil {
+			t.Fatalf("Failed to chdir: %v", err)
+		}
+		defer os.Chdir(origWd)
+
+		// Create test store
+		store := newTestStore(t)
+		defer store.Close()
+
+		// Call Set() which should update both database and config.yaml
+		if err := Set(ctx, store, "beads-sync"); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+
+		// Verify database was updated
+		dbValue, err := store.GetConfig(ctx, ConfigKey)
+		if err != nil {
+			t.Fatalf("GetConfig() error = %v", err)
+		}
+		if dbValue != "beads-sync" {
+			t.Errorf("Database value = %q, want %q", dbValue, "beads-sync")
+		}
+
+		// Verify config.yaml was updated (key uncommented and value set)
+		yamlContent, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatalf("Failed to read config.yaml: %v", err)
+		}
+
+		yamlStr := string(yamlContent)
+		if !strings.Contains(yamlStr, "sync-branch:") {
+			t.Error("config.yaml should contain 'sync-branch:' (uncommented)")
+		}
+		if !strings.Contains(yamlStr, "beads-sync") {
+			t.Errorf("config.yaml should contain 'beads-sync', got:\n%s", yamlStr)
+		}
+		// Should NOT contain the commented version anymore
+		if strings.Contains(yamlStr, "# sync-branch:") {
+			t.Error("config.yaml still has commented '# sync-branch:', should be uncommented")
 		}
 	})
 }
@@ -338,6 +439,18 @@ func TestIsConfiguredWithDB(t *testing.T) {
 		// This tests the code path where dbPath is empty
 		tmpDir, _ := os.MkdirTemp("", "test-no-beads-*")
 		defer os.RemoveAll(tmpDir)
+
+		// Set BEADS_DIR to a nonexistent path to prevent git repo detection
+		// from finding the project's .beads directory
+		origBeadsDir := os.Getenv("BEADS_DIR")
+		os.Setenv("BEADS_DIR", filepath.Join(tmpDir, ".beads"))
+		defer func() {
+			if origBeadsDir != "" {
+				os.Setenv("BEADS_DIR", origBeadsDir)
+			} else {
+				os.Unsetenv("BEADS_DIR")
+			}
+		}()
 
 		origWd, _ := os.Getwd()
 		os.Chdir(tmpDir)

@@ -1,7 +1,7 @@
 { pkgs, self }:
 pkgs.buildGoModule {
   pname = "beads";
-  version = "0.37.0";
+  version = "0.42.0";
 
   src = self;
 
@@ -9,7 +9,7 @@ pkgs.buildGoModule {
   subPackages = [ "cmd/bd" ];
   doCheck = false;
   # Go module dependencies hash - if build fails with hash mismatch, update with the "got:" value
-  vendorHash = "sha256-ovG0EWQFtifHF5leEQTFvTjGvc+yiAjpAaqaV0OklgE=";
+  vendorHash = "sha256-pY5m5ODRgqghyELRwwxOr+xlW41gtJWLXaW53GlLaFw=";
 
   # Git is required for tests
   nativeBuildInputs = [ pkgs.git ];

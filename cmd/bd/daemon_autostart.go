@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/lockfile"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -217,7 +218,7 @@ func acquireStartLock(lockPath, socketPath string) bool {
 	// nolint:gosec // G304: lockPath is derived from secure beads directory
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
-		// Lock file exists - check if it's from a dead process (stale) or alive daemon
+		// Lock file exists - check if daemon is actually starting
 		lockPID, pidErr := readPIDFromFile(lockPath)
 		if pidErr != nil || !isPIDAlive(lockPID) {
 			// Stale lock from crashed process - clean up immediately (avoids 5s wait)
@@ -227,7 +228,17 @@ func acquireStartLock(lockPath, socketPath string) bool {
 			return acquireStartLock(lockPath, socketPath)
 		}
 
-		// PID is alive - daemon is legitimately starting, wait for socket to be ready
+		// PID is alive - but is daemon actually running/starting?
+		// Use flock-based check as authoritative source (immune to PID reuse)
+		beadsDir := filepath.Dir(socketPath)
+		if running, _ := lockfile.TryDaemonLock(beadsDir); !running {
+			// Daemon lock not held - the start attempt failed or process was reused
+			debugLog("startlock PID %d alive but daemon lock not held, cleaning up", lockPID)
+			_ = os.Remove(lockPath)
+			return acquireStartLock(lockPath, socketPath)
+		}
+
+		// Daemon lock is held - daemon is legitimately starting, wait for socket
 		debugLog("another process (PID %d) is starting daemon, waiting for readiness", lockPID)
 		if waitForSocketReadiness(socketPath, 5*time.Second) {
 			return true
@@ -242,11 +253,24 @@ func acquireStartLock(lockPath, socketPath string) bool {
 
 func handleStaleLock(lockPath, socketPath string) bool {
 	lockPID, err := readPIDFromFile(lockPath)
-	if err == nil && !isPIDAlive(lockPID) {
-		debugLog("lock is stale (PID %d dead), removing and retrying", lockPID)
+
+	// Check if PID is dead
+	if err != nil || !isPIDAlive(lockPID) {
+		debugLog("lock is stale (PID %d dead or unreadable), removing and retrying", lockPID)
 		_ = os.Remove(lockPath)
 		return tryAutoStartDaemon(socketPath)
 	}
+
+	// PID is alive - but check daemon lock as authoritative source (immune to PID reuse)
+	beadsDir := filepath.Dir(socketPath)
+	if running, _ := lockfile.TryDaemonLock(beadsDir); !running {
+		debugLog("lock PID %d alive but daemon lock not held, removing and retrying", lockPID)
+		_ = os.Remove(lockPath)
+		return tryAutoStartDaemon(socketPath)
+	}
+
+	// Daemon lock is held - daemon is genuinely running but socket isn't ready
+	// This shouldn't happen normally, but don't clean up a legitimate lock
 	return false
 }
 
@@ -260,19 +284,24 @@ func handleExistingSocket(socketPath string) bool {
 		return true
 	}
 
-	pidFile := getPIDFileForSocket(socketPath)
-	if pidFile != "" {
-		if pid, err := readPIDFromFile(pidFile); err == nil && isPIDAlive(pid) {
-			debugLog("daemon PID %d alive, waiting for socket", pid)
-			return waitForSocketReadiness(socketPath, 5*time.Second)
-		}
+	// Use flock-based check as authoritative source (immune to PID reuse)
+	// If daemon lock is not held, daemon is definitely dead regardless of PID file
+	beadsDir := filepath.Dir(socketPath)
+	if running, pid := lockfile.TryDaemonLock(beadsDir); running {
+		debugLog("daemon lock held (PID %d), waiting for socket", pid)
+		return waitForSocketReadiness(socketPath, 5*time.Second)
 	}
 
-	debugLog("socket is stale, cleaning up")
+	// Lock not held - daemon is dead, clean up stale artifacts
+	debugLog("socket is stale (daemon lock not held), cleaning up")
 	_ = os.Remove(socketPath) // Best-effort cleanup, file may not exist
+	pidFile := getPIDFileForSocket(socketPath)
 	if pidFile != "" {
 		_ = os.Remove(pidFile) // Best-effort cleanup, file may not exist
 	}
+	// Also clean up daemon.lock file (contains stale metadata)
+	lockFile := filepath.Join(beadsDir, "daemon.lock")
+	_ = os.Remove(lockFile) // Best-effort cleanup
 	return false
 }
 
@@ -281,6 +310,14 @@ func determineSocketPath(socketPath string) string {
 }
 
 func startDaemonProcess(socketPath string) bool {
+	// Early check: daemon requires a git repository (unless --local mode)
+	// Skip attempting to start and avoid the 5-second wait if not in git repo
+	if !isGitRepo() {
+		debugLog("not in a git repository, skipping daemon start")
+		fmt.Fprintf(os.Stderr, "%s No git repository initialized - running without background sync\n", ui.RenderMuted("Note:"))
+		return false
+	}
+
 	binPath, err := executableFn()
 	if err != nil {
 		binPath = os.Args[0]
@@ -311,6 +348,17 @@ func startDaemonProcess(socketPath string) bool {
 
 	recordDaemonStartFailure()
 	debugLog("daemon socket not ready after 5 seconds")
+
+	// Check for daemon-error file which contains the actual failure reason
+	beadsDir := filepath.Dir(dbPath)
+	errFile := filepath.Join(beadsDir, "daemon-error")
+	if errContent, err := os.ReadFile(errFile); err == nil && len(errContent) > 0 {
+		// Show the actual error from the daemon
+		fmt.Fprintf(os.Stderr, "%s Daemon failed to start:\n", ui.RenderWarn("Warning:"))
+		fmt.Fprintf(os.Stderr, "%s\n", string(errContent))
+		return false
+	}
+
 	// Emit visible warning so user understands why command was slow
 	fmt.Fprintf(os.Stderr, "%s Daemon took too long to start (>5s). Running in direct mode.\n", ui.RenderWarn("Warning:"))
 	fmt.Fprintf(os.Stderr, "  %s Run 'bd doctor' to diagnose daemon issues\n", ui.RenderMuted("Hint:"))
@@ -407,10 +455,19 @@ func recordDaemonStartFailure() {
 	// No cap needed - backoff is capped at 120s in canRetryDaemonStart
 }
 
-// getSocketPath returns the daemon socket path based on the database location
-// Returns local socket path (.beads/bd.sock relative to database)
+// getSocketPath returns the daemon socket path based on the database location.
+// If BD_SOCKET env var is set, uses that value instead (enables test isolation).
+// On Unix systems, uses rpc.ShortSocketPath to avoid exceeding socket path limits
+// (macOS: 104 chars) by relocating long paths to /tmp/beads-{hash}/ (GH#1001).
 func getSocketPath() string {
-	return filepath.Join(filepath.Dir(dbPath), "bd.sock")
+	// Check environment variable first (enables test isolation)
+	if socketPath := os.Getenv("BD_SOCKET"); socketPath != "" {
+		return socketPath
+	}
+	// Get workspace path (parent of .beads directory)
+	beadsDir := filepath.Dir(dbPath)
+	workspacePath := filepath.Dir(beadsDir)
+	return rpc.ShortSocketPath(workspacePath)
 }
 
 // emitVerboseWarning prints a one-line warning when falling back to direct mode

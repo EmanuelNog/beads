@@ -75,10 +75,14 @@ func formatJSONStringArray(arr []string) string {
 
 // CreateIssue creates a new issue
 func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
-	// Fetch custom statuses for validation
+	// Fetch custom statuses and types for validation
 	customStatuses, err := s.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
+	}
+	customTypes, err := s.GetCustomTypes(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get custom types: %w", err)
 	}
 
 	// Set timestamps first so defensive fixes can use them
@@ -111,8 +115,8 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act
 		issue.DeletedAt = &deletedAt
 	}
 
-	// Validate issue before creating (with custom status support)
-	if err := issue.ValidateWithCustomStatuses(customStatuses); err != nil {
+	// Validate issue before creating (with custom status and type support)
+	if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
@@ -208,8 +212,10 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act
 		}
 	}
 
-	// Insert issue
-	if err := insertIssue(ctx, conn, issue); err != nil {
+	// Insert issue using strict mode (fails on duplicates)
+	// GH#956: Use insertIssueStrict instead of insertIssue to prevent FK constraint errors
+	// from silent INSERT OR IGNORE failures under concurrent load.
+	if err := insertIssueStrict(ctx, conn, issue); err != nil {
 		return wrapDBError("insert issue", err)
 	}
 
@@ -267,6 +273,8 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	var pinned sql.NullInt64
 	// Template field
 	var isTemplate sql.NullInt64
+	// Crystallizes field (work economics)
+	var crystallizes sql.NullInt64
 	// Gate fields
 	var awaitType sql.NullString
 	var awaitID sql.NullString
@@ -286,32 +294,38 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	var actor sql.NullString
 	var target sql.NullString
 	var payload sql.NullString
+	// Time-based scheduling fields (GH#820)
+	var dueAt sql.NullTime
+	var deferUntil sql.NullTime
 
 	var contentHash sql.NullString
 	var compactedAtCommit sql.NullString
+	var owner sql.NullString
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, updated_at, closed_at, external_ref,
+		       created_at, created_by, owner, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
 		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template,
+		       sender, ephemeral, pinned, is_template, crystallizes,
 		       await_type, await_id, timeout_ns, waiters,
 		       hook_bead, role_bead, agent_state, last_activity, role_type, rig, mol_type,
-		       event_kind, actor, target, payload
+		       event_kind, actor, target, payload,
+		       due_at, defer_until
 		FROM issues
 		WHERE id = ?
 	`, id).Scan(
 		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 		&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&issue.CreatedAt, &issue.CreatedBy, &issue.UpdatedAt, &closedAt, &externalRef,
+		&issue.CreatedAt, &issue.CreatedBy, &owner, &issue.UpdatedAt, &closedAt, &externalRef,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
 		&deletedAt, &deletedBy, &deleteReason, &originalType,
-		&sender, &wisp, &pinned, &isTemplate,
+		&sender, &wisp, &pinned, &isTemplate, &crystallizes,
 		&awaitType, &awaitID, &timeoutNs, &waiters,
 		&hookBead, &roleBead, &agentState, &lastActivity, &roleType, &rig, &molType,
 		&eventKind, &actor, &target, &payload,
+		&dueAt, &deferUntil,
 	)
 
 	if err == sql.ErrNoRows {
@@ -333,6 +347,9 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	}
 	if assignee.Valid {
 		issue.Assignee = assignee.String
+	}
+	if owner.Valid {
+		issue.Owner = owner.String
 	}
 	if externalRef.Valid {
 		issue.ExternalRef = &externalRef.String
@@ -376,6 +393,10 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	// Template field
 	if isTemplate.Valid && isTemplate.Int64 != 0 {
 		issue.IsTemplate = true
+	}
+	// Crystallizes field (work economics)
+	if crystallizes.Valid && crystallizes.Int64 != 0 {
+		issue.Crystallizes = true
 	}
 	// Gate fields
 	if awaitType.Valid {
@@ -425,6 +446,13 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	}
 	if payload.Valid {
 		issue.Payload = payload.String
+	}
+	// Time-based scheduling fields (GH#820)
+	if dueAt.Valid {
+		issue.DueAt = &dueAt.Time
+	}
+	if deferUntil.Valid {
+		issue.DeferUntil = &deferUntil.Time
 	}
 
 	// Fetch labels for this issue
@@ -536,19 +564,22 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	var pinned sql.NullInt64
 	// Template field
 	var isTemplate sql.NullInt64
+	// Crystallizes field (work economics)
+	var crystallizes sql.NullInt64
 	// Gate fields
 	var awaitType sql.NullString
 	var awaitID sql.NullString
 	var timeoutNs sql.NullInt64
 	var waiters sql.NullString
 
+	var owner sql.NullString
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, updated_at, closed_at, external_ref,
+		       created_at, created_by, owner, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
 		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template,
+		       sender, ephemeral, pinned, is_template, crystallizes,
 		       await_type, await_id, timeout_ns, waiters
 		FROM issues
 		WHERE external_ref = ?
@@ -556,10 +587,10 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 		&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&issue.CreatedAt, &issue.CreatedBy, &issue.UpdatedAt, &closedAt, &externalRefCol,
+		&issue.CreatedAt, &issue.CreatedBy, &owner, &issue.UpdatedAt, &closedAt, &externalRefCol,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
 		&deletedAt, &deletedBy, &deleteReason, &originalType,
-		&sender, &wisp, &pinned, &isTemplate,
+		&sender, &wisp, &pinned, &isTemplate, &crystallizes,
 		&awaitType, &awaitID, &timeoutNs, &waiters,
 	)
 
@@ -582,6 +613,9 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	}
 	if assignee.Valid {
 		issue.Assignee = assignee.String
+	}
+	if owner.Valid {
+		issue.Owner = owner.String
 	}
 	if externalRefCol.Valid {
 		issue.ExternalRef = &externalRefCol.String
@@ -626,6 +660,10 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	if isTemplate.Valid && isTemplate.Int64 != 0 {
 		issue.IsTemplate = true
 	}
+	// Crystallizes field (work economics)
+	if crystallizes.Valid && crystallizes.Int64 != 0 {
+		issue.Crystallizes = true
+	}
 	// Gate fields
 	if awaitType.Valid {
 		issue.AwaitType = awaitType.String
@@ -664,6 +702,8 @@ var allowedUpdateFields = map[string]bool{
 	"estimated_minutes":   true,
 	"external_ref":        true,
 	"closed_at":           true,
+	"close_reason":        true,
+	"closed_by_session":   true,
 	// Messaging fields
 	"sender": true,
 	"wisp":   true, // Database column is 'ephemeral', mapped in UpdateIssue
@@ -685,6 +725,11 @@ var allowedUpdateFields = map[string]bool{
 	"event_actor":    true,
 	"event_target":   true,
 	"event_payload":  true,
+	// Time-based scheduling fields (GH#820)
+	"due_at":      true,
+	"defer_until": true,
+	// Gate fields (bd-z6kw: support await_id updates for gate discovery)
+	"await_id": true,
 }
 
 // validatePriority validates a priority value
@@ -1070,8 +1115,9 @@ func (s *SQLiteStorage) ResetCounter(ctx context.Context, prefix string) error {
 	return nil
 }
 
-// CloseIssue closes an issue with a reason
-func (s *SQLiteStorage) CloseIssue(ctx context.Context, id string, reason string, actor string) error {
+// CloseIssue closes an issue with a reason.
+// The session parameter tracks which Claude Code session closed the issue (can be empty).
+func (s *SQLiteStorage) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
 	now := time.Now()
 
 	// Update with special event handling
@@ -1086,9 +1132,9 @@ func (s *SQLiteStorage) CloseIssue(ctx context.Context, id string, reason string
 	// 2. events.comment - for audit history (when was it closed, by whom)
 	// Keep both in sync. If refactoring, consider deriving one from the other.
 	result, err := tx.ExecContext(ctx, `
-		UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?
+		UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?
 		WHERE id = ?
-	`, types.StatusClosed, now, now, reason, id)
+	`, types.StatusClosed, now, now, reason, session, id)
 	if err != nil {
 		return fmt.Errorf("failed to close issue: %w", err)
 	}
@@ -1127,15 +1173,16 @@ func (s *SQLiteStorage) CloseIssue(ctx context.Context, id string, reason string
 
 	// Reactive convoy completion: check if any convoys tracking this issue should auto-close
 	// Find convoys that track this issue (convoy.issue_id tracks closed_issue.depends_on_id)
+	// Uses gt:convoy label instead of issue_type for Gas Town separation
 	convoyRows, err := tx.QueryContext(ctx, `
 		SELECT DISTINCT d.issue_id
 		FROM dependencies d
 		JOIN issues i ON d.issue_id = i.id
+		JOIN labels l ON i.id = l.issue_id AND l.label = 'gt:convoy'
 		WHERE d.depends_on_id = ?
 		  AND d.type = ?
-		  AND i.issue_type = ?
 		  AND i.status != ?
-	`, id, types.DepTracks, types.TypeConvoy, types.StatusClosed)
+	`, id, types.DepTracks, types.StatusClosed)
 	if err != nil {
 		return fmt.Errorf("failed to find tracking convoys: %w", err)
 	}
@@ -1716,6 +1763,16 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 		whereClauses = append(whereClauses, fmt.Sprintf("status NOT IN (%s)", strings.Join(placeholders, ",")))
 	}
 
+	// Type exclusion (for hiding internal types like gates, bd-7zka.2)
+	if len(filter.ExcludeTypes) > 0 {
+		placeholders := make([]string, len(filter.ExcludeTypes))
+		for i, t := range filter.ExcludeTypes {
+			placeholders[i] = "?"
+			args = append(args, string(t))
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("issue_type NOT IN (%s)", strings.Join(placeholders, ",")))
+	}
+
 	if filter.Priority != nil {
 		whereClauses = append(whereClauses, "priority = ?")
 		args = append(args, *filter.Priority)
@@ -1806,6 +1863,12 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (%s)", strings.Join(placeholders, ", ")))
 	}
 
+	// ID prefix filtering (for shell completion)
+	if filter.IDPrefix != "" {
+		whereClauses = append(whereClauses, "id LIKE ?")
+		args = append(args, filter.IDPrefix+"%")
+	}
+
 	// Wisp filtering
 	if filter.Ephemeral != nil {
 		if *filter.Ephemeral {
@@ -1845,6 +1908,31 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 		args = append(args, string(*filter.MolType))
 	}
 
+	// Time-based scheduling filters (GH#820)
+	if filter.Deferred {
+		whereClauses = append(whereClauses, "defer_until IS NOT NULL")
+	}
+	if filter.DeferAfter != nil {
+		whereClauses = append(whereClauses, "defer_until > ?")
+		args = append(args, filter.DeferAfter.Format(time.RFC3339))
+	}
+	if filter.DeferBefore != nil {
+		whereClauses = append(whereClauses, "defer_until < ?")
+		args = append(args, filter.DeferBefore.Format(time.RFC3339))
+	}
+	if filter.DueAfter != nil {
+		whereClauses = append(whereClauses, "due_at > ?")
+		args = append(args, filter.DueAfter.Format(time.RFC3339))
+	}
+	if filter.DueBefore != nil {
+		whereClauses = append(whereClauses, "due_at < ?")
+		args = append(args, filter.DueBefore.Format(time.RFC3339))
+	}
+	if filter.Overdue {
+		whereClauses = append(whereClauses, "due_at IS NOT NULL AND due_at < ? AND status != ?")
+		args = append(args, time.Now().Format(time.RFC3339), types.StatusClosed)
+	}
+
 	whereSQL := ""
 	if len(whereClauses) > 0 {
 		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
@@ -1860,9 +1948,9 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 	querySQL := fmt.Sprintf(`
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, updated_at, closed_at, external_ref, source_repo, close_reason,
+		       created_at, created_by, owner, updated_at, closed_at, external_ref, source_repo, close_reason,
 		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template,
+		       sender, ephemeral, pinned, is_template, crystallizes,
 		       await_type, await_id, timeout_ns, waiters
 		FROM issues
 		%s

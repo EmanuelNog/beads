@@ -391,6 +391,149 @@ func TestValidateWithCustomStatuses(t *testing.T) {
 	}
 }
 
+// TestValidateForImport tests the federation trust model (bd-9ji4z):
+// - Built-in types are validated (catch typos)
+// - Non-built-in types are trusted (child repo already validated)
+func TestValidateForImport(t *testing.T) {
+	tests := []struct {
+		name    string
+		issue   Issue
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "built-in type task passes",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: TypeTask,
+			},
+			wantErr: false,
+		},
+		{
+			name: "built-in type bug passes",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: TypeBug,
+			},
+			wantErr: false,
+		},
+		{
+			name: "custom type pm is trusted (not in parent config)",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType("pm"), // Custom type from child repo
+			},
+			wantErr: false, // Should pass - federation trust model
+		},
+		{
+			name: "custom type llm is trusted",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType("llm"), // Custom type from child repo
+			},
+			wantErr: false, // Should pass - federation trust model
+		},
+		{
+			name: "built-in type agent passes",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: TypeAgent, // Gas Town built-in type
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty type defaults to task (handled by SetDefaults)",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType(""), // Empty is allowed
+			},
+			wantErr: false,
+		},
+		{
+			name: "other validations still run - missing title",
+			issue: Issue{
+				Title:     "", // Missing required field
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType("pm"),
+			},
+			wantErr: true,
+			errMsg:  "title is required",
+		},
+		{
+			name: "other validations still run - invalid priority",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  10, // Invalid
+				IssueType: IssueType("pm"),
+			},
+			wantErr: true,
+			errMsg:  "priority must be between 0 and 4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.issue.ValidateForImport(nil) // No custom statuses needed for these tests
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ValidateForImport() expected error, got nil")
+					return
+				}
+				if tt.errMsg != "" && !contains(err.Error(), tt.errMsg) {
+					t.Errorf("ValidateForImport() error = %v, want error containing %q", err, tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("ValidateForImport() unexpected error = %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateForImportVsValidateWithCustom contrasts the two validation modes
+func TestValidateForImportVsValidateWithCustom(t *testing.T) {
+	// Issue with custom type that's NOT in customTypes list
+	issue := Issue{
+		Title:     "Test Issue",
+		Status:    StatusOpen,
+		Priority:  1,
+		IssueType: IssueType("pm"), // Custom type not configured in parent
+	}
+
+	// ValidateWithCustom (normal mode): should fail without pm in customTypes
+	err := issue.ValidateWithCustom(nil, nil)
+	if err == nil {
+		t.Error("ValidateWithCustom() should fail for custom type without config")
+	}
+
+	// ValidateWithCustom: should pass with pm in customTypes
+	err = issue.ValidateWithCustom(nil, []string{"pm"})
+	if err != nil {
+		t.Errorf("ValidateWithCustom() with pm config should pass, got: %v", err)
+	}
+
+	// ValidateForImport (federation trust mode): should pass without any config
+	err = issue.ValidateForImport(nil)
+	if err != nil {
+		t.Errorf("ValidateForImport() should trust custom type, got: %v", err)
+	}
+}
+
 func TestIssueTypeIsValid(t *testing.T) {
 	tests := []struct {
 		issueType IssueType
@@ -401,6 +544,15 @@ func TestIssueTypeIsValid(t *testing.T) {
 		{TypeTask, true},
 		{TypeEpic, true},
 		{TypeChore, true},
+		{TypeMessage, true},
+		{TypeMergeRequest, true},
+		{TypeMolecule, true},
+		{TypeGate, true},
+		{TypeAgent, true},
+		{TypeRole, true},
+		{TypeConvoy, true},
+		{TypeEvent, true},
+		{TypeSlot, true},
 		{IssueType("invalid"), false},
 		{IssueType(""), false},
 	}
@@ -409,6 +561,40 @@ func TestIssueTypeIsValid(t *testing.T) {
 		t.Run(string(tt.issueType), func(t *testing.T) {
 			if got := tt.issueType.IsValid(); got != tt.valid {
 				t.Errorf("IssueType(%q).IsValid() = %v, want %v", tt.issueType, got, tt.valid)
+			}
+		})
+	}
+}
+
+func TestIssueTypeRequiredSections(t *testing.T) {
+	tests := []struct {
+		issueType     IssueType
+		expectCount   int
+		expectHeading string // First heading if any
+	}{
+		{TypeBug, 2, "## Steps to Reproduce"},
+		{TypeFeature, 1, "## Acceptance Criteria"},
+		{TypeTask, 1, "## Acceptance Criteria"},
+		{TypeEpic, 1, "## Success Criteria"},
+		{TypeChore, 0, ""},
+		{TypeMessage, 0, ""},
+		{TypeMolecule, 0, ""},
+		{TypeGate, 0, ""},
+		{TypeEvent, 0, ""},
+		{TypeMergeRequest, 0, ""},
+		// Gas Town types (agent, role, rig, convoy, slot) have been removed
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.issueType), func(t *testing.T) {
+			sections := tt.issueType.RequiredSections()
+			if len(sections) != tt.expectCount {
+				t.Errorf("IssueType(%q).RequiredSections() returned %d sections, want %d",
+					tt.issueType, len(sections), tt.expectCount)
+			}
+			if tt.expectCount > 0 && sections[0].Heading != tt.expectHeading {
+				t.Errorf("IssueType(%q).RequiredSections()[0].Heading = %q, want %q",
+					tt.issueType, sections[0].Heading, tt.expectHeading)
 			}
 		})
 	}
@@ -522,6 +708,7 @@ func TestDependencyTypeIsWellKnown(t *testing.T) {
 		{DepAuthoredBy, true},
 		{DepAssignedTo, true},
 		{DepApprovedBy, true},
+		{DepAttests, true},
 		{DepTracks, true},
 		{DepUntil, true},
 		{DepCausedBy, true},
@@ -557,6 +744,7 @@ func TestDependencyTypeAffectsReadyWork(t *testing.T) {
 		{DepAuthoredBy, false},
 		{DepAssignedTo, false},
 		{DepApprovedBy, false},
+		{DepAttests, false},
 		{DepTracks, false},
 		{DepUntil, false},
 		{DepCausedBy, false},

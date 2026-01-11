@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/syncbranch"
@@ -117,6 +118,13 @@ func checkGitForIssues() (int, string, string) {
 		return 0, "", ""
 	}
 
+	// GH#896: Reject beadsDir that is outside the git repository.
+	// This prevents bd init from inheriting issues from a parent hub
+	// when initializing a new project in a subdirectory.
+	if strings.HasPrefix(relBeads, "..") {
+		return 0, "", ""
+	}
+
 	// Determine which branch to read from (bd-0is fix)
 	// If sync-branch is configured in local config.yaml, use it; otherwise fall back to HEAD
 	// We read sync-branch directly from local config file rather than using cached global config
@@ -173,6 +181,7 @@ func isNoDbModeConfigured(beadsDir string) bool {
 
 	var cfg localConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		debug.Logf("Warning: failed to parse config.yaml for no-db check: %v", err)
 		return false
 	}
 
@@ -198,6 +207,7 @@ func getLocalSyncBranch(beadsDir string) string {
 	// Parse YAML properly to handle edge cases (comments, indentation, special chars)
 	var cfg localConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		debug.Logf("Warning: failed to parse config.yaml for sync-branch: %v", err)
 		return ""
 	}
 

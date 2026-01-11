@@ -17,9 +17,22 @@ var closeCmd = &cobra.Command{
 	Use:     "close [id...]",
 	GroupID: "issues",
 	Short:   "Close one or more issues",
-	Args:    cobra.MinimumNArgs(1),
+	Long: `Close one or more issues.
+
+If no issue ID is provided, closes the last touched issue (from most recent
+create, update, show, or close operation).`,
+	Args: cobra.MinimumNArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("close")
+
+		// If no IDs provided, use last touched issue
+		if len(args) == 0 {
+			lastTouched := GetLastTouchedID()
+			if lastTouched == "" {
+				FatalErrorRespectJSON("no issue ID provided and no last touched issue")
+			}
+			args = []string{lastTouched}
+		}
 		reason, _ := cmd.Flags().GetString("reason")
 		if reason == "" {
 			// Check --resolution alias (Jira CLI convention)
@@ -33,6 +46,12 @@ var closeCmd = &cobra.Command{
 		noAuto, _ := cmd.Flags().GetBool("no-auto")
 		suggestNext, _ := cmd.Flags().GetBool("suggest-next")
 
+		// Get session ID from flag or environment variable
+		session, _ := cmd.Flags().GetString("session")
+		if session == "" {
+			session = os.Getenv("CLAUDE_SESSION_ID")
+		}
+
 		ctx := rootCtx
 
 		// --continue only works with a single issue
@@ -45,10 +64,16 @@ var closeCmd = &cobra.Command{
 			FatalErrorRespectJSON("--suggest-next only works when closing a single issue")
 		}
 
-		// Resolve partial IDs first
+		// Resolve partial IDs first, handling cross-rig routing
 		var resolvedIDs []string
+		var routedArgs []string // IDs that need cross-repo routing (bypass daemon)
 		if daemonClient != nil {
 			for _, id := range args {
+				// Check if this ID needs routing to a different beads directory
+				if needsRouting(id) {
+					routedArgs = append(routedArgs, id)
+					continue
+				}
 				resolveArgs := &rpc.ResolveIDArgs{ID: id}
 				resp, err := daemonClient.ResolveID(resolveArgs)
 				if err != nil {
@@ -61,10 +86,17 @@ var closeCmd = &cobra.Command{
 				resolvedIDs = append(resolvedIDs, resolvedID)
 			}
 		} else {
-			var err error
-			resolvedIDs, err = utils.ResolvePartialIDs(ctx, store, args)
-			if err != nil {
-				FatalErrorRespectJSON("%v", err)
+			// Direct mode - check routing for each ID
+			for _, id := range args {
+				if needsRouting(id) {
+					routedArgs = append(routedArgs, id)
+				} else {
+					resolved, err := utils.ResolvePartialID(ctx, store, id)
+					if err != nil {
+						FatalErrorRespectJSON("resolving ID %s: %v", id, err)
+					}
+					resolvedIDs = append(resolvedIDs, resolved)
+				}
 			}
 		}
 
@@ -88,7 +120,9 @@ var closeCmd = &cobra.Command{
 				closeArgs := &rpc.CloseArgs{
 					ID:          id,
 					Reason:      reason,
+					Session:     session,
 					SuggestNext: suggestNext,
+					Force:       force,
 				}
 				resp, err := daemonClient.CloseIssue(closeArgs)
 				if err != nil {
@@ -137,6 +171,64 @@ var closeCmd = &cobra.Command{
 				}
 			}
 
+			// Handle routed IDs via direct mode (cross-rig)
+			for _, id := range routedArgs {
+				result, err := resolveAndGetIssueWithRouting(ctx, store, id)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
+					continue
+				}
+				if result == nil || result.Issue == nil {
+					if result != nil {
+						result.Close()
+					}
+					fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
+					continue
+				}
+
+				if err := validateIssueClosable(result.ResolvedID, result.Issue, force); err != nil {
+					result.Close()
+					fmt.Fprintf(os.Stderr, "%s\n", err)
+					continue
+				}
+
+				// Check if issue has open blockers (GH#962)
+				if !force {
+					blocked, blockers, err := result.Store.IsBlocked(ctx, result.ResolvedID)
+					if err != nil {
+						result.Close()
+						fmt.Fprintf(os.Stderr, "Error checking blockers for %s: %v\n", id, err)
+						continue
+					}
+					if blocked && len(blockers) > 0 {
+						result.Close()
+						fmt.Fprintf(os.Stderr, "cannot close %s: blocked by open issues %v (use --force to override)\n", id, blockers)
+						continue
+					}
+				}
+
+				if err := result.Store.CloseIssue(ctx, result.ResolvedID, reason, actor, session); err != nil {
+					result.Close()
+					fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
+					continue
+				}
+
+				// Get updated issue for hook
+				closedIssue, _ := result.Store.GetIssue(ctx, result.ResolvedID)
+				if closedIssue != nil && hookRunner != nil {
+					hookRunner.Run(hooks.EventClose, closedIssue)
+				}
+
+				if jsonOutput {
+					if closedIssue != nil {
+						closedIssues = append(closedIssues, closedIssue)
+					}
+				} else {
+					fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), result.ResolvedID, reason)
+				}
+				result.Close()
+			}
+
 			// Handle --continue flag in daemon mode
 			// Note: --continue requires direct database access to walk parent-child chain
 			if continueFlag && len(closedIssues) > 0 {
@@ -153,6 +245,8 @@ var closeCmd = &cobra.Command{
 		// Direct mode
 		closedIssues := []*types.Issue{}
 		closedCount := 0
+
+		// Handle local IDs
 		for _, id := range resolvedIDs {
 			// Get issue for checks
 			issue, _ := store.GetIssue(ctx, id)
@@ -162,7 +256,20 @@ var closeCmd = &cobra.Command{
 				continue
 			}
 
-			if err := store.CloseIssue(ctx, id, reason, actor); err != nil {
+			// Check if issue has open blockers (GH#962)
+			if !force {
+				blocked, blockers, err := store.IsBlocked(ctx, id)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error checking blockers for %s: %v\n", id, err)
+					continue
+				}
+				if blocked && len(blockers) > 0 {
+					fmt.Fprintf(os.Stderr, "cannot close %s: blocked by open issues %v (use --force to override)\n", id, blockers)
+					continue
+				}
+			}
+
+			if err := store.CloseIssue(ctx, id, reason, actor, session); err != nil {
 				fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
 				continue
 			}
@@ -182,6 +289,66 @@ var closeCmd = &cobra.Command{
 			} else {
 				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), id, reason)
 			}
+		}
+
+		// Handle routed IDs (cross-rig)
+		for _, id := range routedArgs {
+			result, err := resolveAndGetIssueWithRouting(ctx, store, id)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
+				continue
+			}
+			if result == nil || result.Issue == nil {
+				if result != nil {
+					result.Close()
+				}
+				fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
+				continue
+			}
+
+			if err := validateIssueClosable(result.ResolvedID, result.Issue, force); err != nil {
+				result.Close()
+				fmt.Fprintf(os.Stderr, "%s\n", err)
+				continue
+			}
+
+			// Check if issue has open blockers (GH#962)
+			if !force {
+				blocked, blockers, err := result.Store.IsBlocked(ctx, result.ResolvedID)
+				if err != nil {
+					result.Close()
+					fmt.Fprintf(os.Stderr, "Error checking blockers for %s: %v\n", id, err)
+					continue
+				}
+				if blocked && len(blockers) > 0 {
+					result.Close()
+					fmt.Fprintf(os.Stderr, "cannot close %s: blocked by open issues %v (use --force to override)\n", id, blockers)
+					continue
+				}
+			}
+
+			if err := result.Store.CloseIssue(ctx, result.ResolvedID, reason, actor, session); err != nil {
+				result.Close()
+				fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
+				continue
+			}
+
+			closedCount++
+
+			// Get updated issue for hook
+			closedIssue, _ := result.Store.GetIssue(ctx, result.ResolvedID)
+			if closedIssue != nil && hookRunner != nil {
+				hookRunner.Run(hooks.EventClose, closedIssue)
+			}
+
+			if jsonOutput {
+				if closedIssue != nil {
+					closedIssues = append(closedIssues, closedIssue)
+				}
+			} else {
+				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), result.ResolvedID, reason)
+			}
+			result.Close()
 		}
 
 		// Handle --suggest-next flag in direct mode
@@ -240,5 +407,7 @@ func init() {
 	closeCmd.Flags().Bool("continue", false, "Auto-advance to next step in molecule")
 	closeCmd.Flags().Bool("no-auto", false, "With --continue, show next step but don't claim it")
 	closeCmd.Flags().Bool("suggest-next", false, "Show newly unblocked issues after closing")
+	closeCmd.Flags().String("session", "", "Claude Code session ID (or set CLAUDE_SESSION_ID env var)")
+	closeCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(closeCmd)
 }

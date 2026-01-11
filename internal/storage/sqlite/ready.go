@@ -41,7 +41,8 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 		// - gate: async wait conditions
 		// - molecule: workflow containers
 		// - message: mail/communication items
-		whereClauses = append(whereClauses, "i.issue_type NOT IN ('merge-request', 'gate', 'molecule', 'message')")
+		// - agent: identity/state tracking beads
+		whereClauses = append(whereClauses, "i.issue_type NOT IN ('merge-request', 'gate', 'molecule', 'message', 'agent')")
 	}
 
 	if filter.Priority != nil {
@@ -112,6 +113,13 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 		args = append(args, string(*filter.MolType))
 	}
 
+	// Time-based deferral filtering (GH#820)
+	// By default, exclude issues where defer_until is in the future.
+	// If IncludeDeferred is true, skip this filter to show deferred issues.
+	if !filter.IncludeDeferred {
+		whereClauses = append(whereClauses, "(i.defer_until IS NULL OR datetime(i.defer_until) <= datetime('now'))")
+	}
+
 	// Build WHERE clause properly
 	whereSQL := strings.Join(whereClauses, " AND ")
 
@@ -144,9 +152,9 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 	query := fmt.Sprintf(`
 		SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
 		i.status, i.priority, i.issue_type, i.assignee, i.estimated_minutes,
-		i.created_at, i.created_by, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
+		i.created_at, i.created_by, i.owner, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
 		i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
-		i.sender, i.ephemeral, i.pinned, i.is_template,
+		i.sender, i.ephemeral, i.pinned, i.is_template, i.crystallizes,
 		i.await_type, i.await_id, i.timeout_ns, i.waiters
 		FROM issues i
 		WHERE %s
@@ -183,6 +191,10 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 // filterByExternalDeps removes issues that have unsatisfied external dependencies.
 // External deps have format: external:<project>:<capability>
 // They are satisfied when the target project has a closed issue with provides:<capability> label.
+//
+// Optimization: Collects all unique external refs across all issues, then checks
+// them in batch (one DB open per external project) rather than checking each
+// ref individually. This avoids O(N) DB opens when issues share external deps.
 func (s *SQLiteStorage) filterByExternalDeps(ctx context.Context, issues []*types.Issue) ([]*types.Issue, error) {
 	if len(issues) == 0 {
 		return issues, nil
@@ -205,12 +217,26 @@ func (s *SQLiteStorage) filterByExternalDeps(ctx context.Context, issues []*type
 		return issues, nil
 	}
 
-	// Check each external dep and build set of blocked issue IDs
+	// Collect all unique external refs across all issues
+	uniqueRefs := make(map[string]bool)
+	for _, deps := range externalDeps {
+		for _, dep := range deps {
+			uniqueRefs[dep] = true
+		}
+	}
+
+	// Check all refs in batch (grouped by project internally)
+	refList := make([]string, 0, len(uniqueRefs))
+	for ref := range uniqueRefs {
+		refList = append(refList, ref)
+	}
+	statuses := CheckExternalDeps(ctx, refList)
+
+	// Build set of blocked issue IDs using batch results
 	blockedIssues := make(map[string]bool)
 	for issueID, deps := range externalDeps {
 		for _, dep := range deps {
-			status := CheckExternalDep(ctx, dep)
-			if !status.Satisfied {
+			if status, ok := statuses[dep]; ok && !status.Satisfied {
 				blockedIssues[issueID] = true
 				break // One unsatisfied dep is enough to block
 			}
@@ -654,6 +680,52 @@ func filterBlockedByExternalDeps(ctx context.Context, blocked []*types.BlockedIs
 	return result
 }
 
+// IsBlocked checks if an issue is blocked by open dependencies (GH#962).
+// Returns true if the issue is in the blocked_issues_cache, along with a list
+// of issue IDs that are blocking it.
+// This is used to prevent closing issues that still have open blockers.
+func (s *SQLiteStorage) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
+	// First check if the issue is in the blocked cache
+	var inCache bool
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM blocked_issues_cache WHERE issue_id = ?)
+	`, issueID).Scan(&inCache)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to check blocked status: %w", err)
+	}
+
+	if !inCache {
+		return false, nil, nil
+	}
+
+	// Get the blocking issue IDs
+	// We query dependencies for 'blocks' type where the blocker is still open
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT d.depends_on_id
+		FROM dependencies d
+		JOIN issues blocker ON d.depends_on_id = blocker.id
+		WHERE d.issue_id = ?
+		  AND d.type = 'blocks'
+		  AND blocker.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
+		ORDER BY blocker.priority ASC
+	`, issueID)
+	if err != nil {
+		return true, nil, fmt.Errorf("failed to get blockers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var blockers []string
+	for rows.Next() {
+		var blockerID string
+		if err := rows.Scan(&blockerID); err != nil {
+			return true, nil, fmt.Errorf("failed to scan blocker ID: %w", err)
+		}
+		blockers = append(blockers, blockerID)
+	}
+
+	return true, blockers, rows.Err()
+}
+
 // GetNewlyUnblockedByClose returns issues that became unblocked when the given issue was closed.
 // This is used by the --suggest-next flag on bd close to show what work is now available.
 // An issue is "newly unblocked" if:
@@ -672,9 +744,9 @@ func (s *SQLiteStorage) GetNewlyUnblockedByClose(ctx context.Context, closedIssu
 	query := `
 		SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
 		       i.status, i.priority, i.issue_type, i.assignee, i.estimated_minutes,
-		       i.created_at, i.created_by, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
+		       i.created_at, i.created_by, i.owner, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
 		       i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
-		       i.sender, i.ephemeral, i.pinned, i.is_template,
+		       i.sender, i.ephemeral, i.pinned, i.is_template, i.crystallizes,
 		       i.await_type, i.await_id, i.timeout_ns, i.waiters
 		FROM issues i
 		JOIN dependencies d ON i.id = d.issue_id

@@ -30,17 +30,24 @@ type Issue struct {
 
 	// ===== Assignment =====
 	Assignee         string `json:"assignee,omitempty"`
+	Owner            string `json:"owner,omitempty"` // Human owner for CV attribution (git author email)
 	EstimatedMinutes *int   `json:"estimated_minutes,omitempty"`
 
 	// ===== Timestamps =====
 	CreatedAt   time.Time  `json:"created_at"`
 	CreatedBy   string     `json:"created_by,omitempty"` // Who created this issue (GH#748)
 	UpdatedAt   time.Time  `json:"updated_at"`
-	ClosedAt    *time.Time `json:"closed_at,omitempty"`
-	CloseReason string     `json:"close_reason,omitempty"` // Reason provided when closing
+	ClosedAt        *time.Time `json:"closed_at,omitempty"`
+	CloseReason     string     `json:"close_reason,omitempty"`      // Reason provided when closing
+	ClosedBySession string     `json:"closed_by_session,omitempty"` // Claude Code session that closed this issue
+
+	// ===== Time-Based Scheduling (GH#820) =====
+	DueAt      *time.Time `json:"due_at,omitempty"`      // When this issue should be completed
+	DeferUntil *time.Time `json:"defer_until,omitempty"` // Hide from bd ready until this time
 
 	// ===== External Integration =====
-	ExternalRef *string `json:"external_ref,omitempty"` // e.g., "gh-9", "jira-ABC"
+	ExternalRef  *string `json:"external_ref,omitempty"`  // e.g., "gh-9", "jira-ABC"
+	SourceSystem string  `json:"source_system,omitempty"` // Adapter/system that created this issue (federation)
 
 	// ===== Compaction Metadata =====
 	CompactionLevel   int        `json:"compaction_level,omitempty"`
@@ -77,14 +84,19 @@ type Issue struct {
 	BondedFrom []BondRef `json:"bonded_from,omitempty"` // For compounds: constituent protos
 
 	// ===== HOP Fields (entity tracking for CV chains) =====
-	Creator     *EntityRef   `json:"creator,omitempty"`     // Who created (human, agent, or org)
-	Validations []Validation `json:"validations,omitempty"` // Who validated/approved
+	Creator      *EntityRef   `json:"creator,omitempty"`       // Who created (human, agent, or org)
+	Validations  []Validation `json:"validations,omitempty"`   // Who validated/approved
+	QualityScore *float32     `json:"quality_score,omitempty"` // Aggregate quality (0.0-1.0), set by Refineries on merge
+	Crystallizes bool         `json:"crystallizes,omitempty"`  // Work that compounds (true: code, features) vs evaporates (false: ops, support) - affects CV weighting per Decision 006
 
 	// ===== Gate Fields (async coordination primitives) =====
 	AwaitType string        `json:"await_type,omitempty"` // Condition type: gh:run, gh:pr, timer, human, mail
 	AwaitID   string        `json:"await_id,omitempty"`   // Condition identifier (run ID, PR number, etc.)
 	Timeout   time.Duration `json:"timeout,omitempty"`    // Max wait time before escalation
 	Waiters   []string      `json:"waiters,omitempty"`    // Mail addresses to notify when gate clears
+
+	// ===== Slot Fields (exclusive access primitives) =====
+	Holder string `json:"holder,omitempty"` // Who currently holds the slot (empty = available)
 
 	// ===== Source Tracing Fields (formula cooking origin) =====
 	SourceFormula  string `json:"source_formula,omitempty"`  // Formula name where step was defined
@@ -100,6 +112,9 @@ type Issue struct {
 
 	// ===== Molecule Type Fields (swarm coordination) =====
 	MolType MolType `json:"mol_type,omitempty"` // Molecule type: swarm|patrol|work (empty = work)
+
+	// ===== Work Type Fields (assignment model - Decision 006) =====
+	WorkType WorkType `json:"work_type,omitempty"` // Work type: mutex|open_competition (empty = mutex)
 
 	// ===== Event Fields (operational state changes) =====
 	EventKind string `json:"event_kind,omitempty"` // Namespaced event type: patrol.muted, agent.started
@@ -125,10 +140,12 @@ func (i *Issue) ComputeContentHash() string {
 	w.int(i.Priority)
 	w.str(string(i.IssueType))
 	w.str(i.Assignee)
+	w.str(i.Owner)
 	w.str(i.CreatedBy)
 
 	// Optional fields
 	w.strPtr(i.ExternalRef)
+	w.str(i.SourceSystem)
 	w.flag(i.Pinned, "pinned")
 	w.flag(i.IsTemplate, "template")
 
@@ -150,6 +167,10 @@ func (i *Issue) ComputeContentHash() string {
 		w.float32Ptr(v.Score)
 	}
 
+	// HOP aggregate quality score and crystallizes
+	w.float32Ptr(i.QualityScore)
+	w.flag(i.Crystallizes, "crystallizes")
+
 	// Gate fields for async coordination
 	w.str(i.AwaitType)
 	w.str(i.AwaitID)
@@ -157,6 +178,9 @@ func (i *Issue) ComputeContentHash() string {
 	for _, waiter := range i.Waiters {
 		w.str(waiter)
 	}
+
+	// Slot fields for exclusive access
+	w.str(i.Holder)
 
 	// Agent identity fields
 	w.str(i.HookBead)
@@ -167,6 +191,9 @@ func (i *Issue) ComputeContentHash() string {
 
 	// Molecule type
 	w.str(string(i.MolType))
+
+	// Work type
+	w.str(string(i.WorkType))
 
 	// Event fields
 	w.str(i.EventKind)
@@ -289,6 +316,12 @@ func (i *Issue) Validate() error {
 // ValidateWithCustomStatuses checks if the issue has valid field values,
 // allowing custom statuses in addition to built-in ones.
 func (i *Issue) ValidateWithCustomStatuses(customStatuses []string) error {
+	return i.ValidateWithCustom(customStatuses, nil)
+}
+
+// ValidateWithCustom checks if the issue has valid field values,
+// allowing custom statuses and types in addition to built-in ones.
+func (i *Issue) ValidateWithCustom(customStatuses, customTypes []string) error {
 	if len(i.Title) == 0 {
 		return fmt.Errorf("title is required")
 	}
@@ -301,7 +334,7 @@ func (i *Issue) ValidateWithCustomStatuses(customStatuses []string) error {
 	if !i.Status.IsValidWithCustom(customStatuses) {
 		return fmt.Errorf("invalid status: %s", i.Status)
 	}
-	if !i.IssueType.IsValid() {
+	if !i.IssueType.IsValidWithCustom(customTypes) {
 		return fmt.Errorf("invalid issue type: %s", i.IssueType)
 	}
 	if i.EstimatedMinutes != nil && *i.EstimatedMinutes < 0 {
@@ -316,6 +349,55 @@ func (i *Issue) ValidateWithCustomStatuses(customStatuses []string) error {
 		return fmt.Errorf("non-closed issues cannot have closed_at timestamp")
 	}
 	// Enforce tombstone invariants: deleted_at must be set for tombstones, and only for tombstones
+	if i.Status == StatusTombstone && i.DeletedAt == nil {
+		return fmt.Errorf("tombstone issues must have deleted_at timestamp")
+	}
+	if i.Status != StatusTombstone && i.DeletedAt != nil {
+		return fmt.Errorf("non-tombstone issues cannot have deleted_at timestamp")
+	}
+	// Validate agent state if set
+	if !i.AgentState.IsValid() {
+		return fmt.Errorf("invalid agent state: %s", i.AgentState)
+	}
+	return nil
+}
+
+// ValidateForImport validates the issue for multi-repo import (federation trust model).
+// Built-in types are validated (to catch typos). Non-built-in types are trusted
+// since the source repo already validated them when the issue was created.
+// This implements "trust the chain below you" from the HOP federation model.
+func (i *Issue) ValidateForImport(customStatuses []string) error {
+	if len(i.Title) == 0 {
+		return fmt.Errorf("title is required")
+	}
+	if len(i.Title) > 500 {
+		return fmt.Errorf("title must be 500 characters or less (got %d)", len(i.Title))
+	}
+	if i.Priority < 0 || i.Priority > 4 {
+		return fmt.Errorf("priority must be between 0 and 4 (got %d)", i.Priority)
+	}
+	if !i.Status.IsValidWithCustom(customStatuses) {
+		return fmt.Errorf("invalid status: %s", i.Status)
+	}
+	// Issue type validation: federation trust model
+	// Only validate built-in types (catch typos like "tsak" vs "task")
+	// Trust non-built-in types from source repo
+	if i.IssueType != "" && i.IssueType.IsValid() {
+		// Built-in type - it's valid
+	} else if i.IssueType != "" && !i.IssueType.IsValid() {
+		// Non-built-in type - trust it (child repo already validated)
+	}
+	if i.EstimatedMinutes != nil && *i.EstimatedMinutes < 0 {
+		return fmt.Errorf("estimated_minutes cannot be negative")
+	}
+	// Enforce closed_at invariant
+	if i.Status == StatusClosed && i.ClosedAt == nil {
+		return fmt.Errorf("closed issues must have closed_at timestamp")
+	}
+	if i.Status != StatusClosed && i.Status != StatusTombstone && i.ClosedAt != nil {
+		return fmt.Errorf("non-closed issues cannot have closed_at timestamp")
+	}
+	// Enforce tombstone invariants
 	if i.Status == StatusTombstone && i.DeletedAt == nil {
 		return fmt.Errorf("tombstone issues must have deleted_at timestamp")
 	}
@@ -406,17 +488,74 @@ const (
 	TypeGate         IssueType = "gate"          // Async coordination gate
 	TypeAgent        IssueType = "agent"         // Agent identity bead
 	TypeRole         IssueType = "role"          // Agent role definition
+	TypeRig          IssueType = "rig"           // Rig identity bead (multi-repo workspace)
 	TypeConvoy       IssueType = "convoy"        // Cross-project tracking with reactive completion
 	TypeEvent        IssueType = "event"         // Operational state change record
+	TypeSlot         IssueType = "slot"          // Exclusive access slot (merge-slot gate)
 )
 
 // IsValid checks if the issue type value is valid
 func (t IssueType) IsValid() bool {
 	switch t {
-	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeMessage, TypeMergeRequest, TypeMolecule, TypeGate, TypeAgent, TypeRole, TypeConvoy, TypeEvent:
+	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeMessage, TypeMergeRequest, TypeMolecule, TypeGate, TypeAgent, TypeRole, TypeRig, TypeConvoy, TypeEvent, TypeSlot:
 		return true
 	}
 	return false
+}
+
+// IsBuiltIn returns true if the type is a built-in type (same as IsValid).
+// Used during multi-repo hydration to determine trust:
+// - Built-in types: validate (catch typos)
+// - Custom types (!IsBuiltIn): trust from source repo
+func (t IssueType) IsBuiltIn() bool {
+	return t.IsValid()
+}
+
+// IsValidWithCustom checks if the issue type is valid, including custom types.
+// Custom types are user-defined via bd config set types.custom "type1,type2,..."
+func (t IssueType) IsValidWithCustom(customTypes []string) bool {
+	// First check built-in types
+	if t.IsValid() {
+		return true
+	}
+	// Then check custom types
+	for _, custom := range customTypes {
+		if string(t) == custom {
+			return true
+		}
+	}
+	return false
+}
+
+// RequiredSection describes a recommended section for an issue type.
+// Used by bd lint and bd create --validate for template validation.
+type RequiredSection struct {
+	Heading string // Markdown heading, e.g., "## Steps to Reproduce"
+	Hint    string // Guidance for what to include
+}
+
+// RequiredSections returns the recommended sections for this issue type.
+// Returns nil for types with no specific section requirements.
+func (t IssueType) RequiredSections() []RequiredSection {
+	switch t {
+	case TypeBug:
+		return []RequiredSection{
+			{Heading: "## Steps to Reproduce", Hint: "Describe how to reproduce the bug"},
+			{Heading: "## Acceptance Criteria", Hint: "Define criteria to verify the fix"},
+		}
+	case TypeTask, TypeFeature:
+		return []RequiredSection{
+			{Heading: "## Acceptance Criteria", Hint: "Define criteria to verify completion"},
+		}
+	case TypeEpic:
+		return []RequiredSection{
+			{Heading: "## Success Criteria", Hint: "Define high-level success criteria"},
+		}
+	default:
+		// Chore, message, molecule, gate, agent, role, convoy, event, merge-request
+		// have no required sections
+		return nil
+	}
 }
 
 // AgentState represents the self-reported state of an agent
@@ -458,6 +597,24 @@ func (m MolType) IsValid() bool {
 	switch m {
 	case MolTypeSwarm, MolTypePatrol, MolTypeWork, "":
 		return true // empty is valid (defaults to work)
+	}
+	return false
+}
+
+// WorkType categorizes how work assignment operates for a bead (Decision 006)
+type WorkType string
+
+// WorkType constants
+const (
+	WorkTypeMutex           WorkType = "mutex"            // One worker, exclusive assignment (default)
+	WorkTypeOpenCompetition WorkType = "open_competition" // Many submit, buyer picks
+)
+
+// IsValid checks if the work type value is valid
+func (w WorkType) IsValid() bool {
+	switch w {
+	case WorkTypeMutex, WorkTypeOpenCompetition, "":
+		return true // empty is valid (defaults to mutex)
 	}
 	return false
 }
@@ -533,6 +690,7 @@ const (
 	DepAuthoredBy DependencyType = "authored-by" // Creator relationship
 	DepAssignedTo DependencyType = "assigned-to" // Assignment relationship
 	DepApprovedBy DependencyType = "approved-by" // Approval relationship
+	DepAttests    DependencyType = "attests"     // Skill attestation: X attests Y has skill Z
 
 	// Convoy tracking (non-blocking cross-project references)
 	DepTracks DependencyType = "tracks" // Convoy → issue tracking (non-blocking)
@@ -541,6 +699,9 @@ const (
 	DepUntil     DependencyType = "until"     // Active until target closes (e.g., muted until issue resolved)
 	DepCausedBy  DependencyType = "caused-by" // Triggered by target (audit trail)
 	DepValidates DependencyType = "validates" // Approval/validation relationship
+
+	// Delegation types (work delegation chains)
+	DepDelegatedFrom DependencyType = "delegated-from" // Work delegated from parent; completion cascades up
 )
 
 // IsValid checks if the dependency type value is valid.
@@ -556,8 +717,8 @@ func (d DependencyType) IsWellKnown() bool {
 	switch d {
 	case DepBlocks, DepParentChild, DepConditionalBlocks, DepWaitsFor, DepRelated, DepDiscoveredFrom,
 		DepRepliesTo, DepRelatesTo, DepDuplicates, DepSupersedes,
-		DepAuthoredBy, DepAssignedTo, DepApprovedBy, DepTracks,
-		DepUntil, DepCausedBy, DepValidates:
+		DepAuthoredBy, DepAssignedTo, DepApprovedBy, DepAttests, DepTracks,
+		DepUntil, DepCausedBy, DepValidates, DepDelegatedFrom:
 		return true
 	}
 	return false
@@ -584,6 +745,22 @@ const (
 	WaitsForAllChildren = "all-children" // Wait for all dynamic children to complete
 	WaitsForAnyChildren = "any-children" // Proceed when first child completes (future)
 )
+
+// AttestsMeta holds metadata for attests dependencies (skill attestations).
+// Stored as JSON in the Dependency.Metadata field.
+// Enables: Entity X attests that Entity Y has skill Z at level N.
+type AttestsMeta struct {
+	// Skill is the identifier of the skill being attested (e.g., "go", "rust", "code-review")
+	Skill string `json:"skill"`
+	// Level is the proficiency level (e.g., "beginner", "intermediate", "expert", or numeric 1-5)
+	Level string `json:"level"`
+	// Date is when the attestation was made (RFC3339 format)
+	Date string `json:"date"`
+	// Evidence is optional reference to supporting evidence (e.g., issue ID, commit, PR)
+	Evidence string `json:"evidence,omitempty"`
+	// Notes is optional free-form notes about the attestation
+	Notes string `json:"notes,omitempty"`
+}
 
 // FailureCloseKeywords are keywords that indicate an issue was closed due to failure.
 // Used by conditional-blocks dependencies to determine if the condition is met.
@@ -677,6 +854,19 @@ type TreeNode struct {
 	Truncated bool   `json:"truncated"`
 }
 
+// MoleculeProgressStats provides efficient progress info for large molecules.
+// This uses indexed queries instead of loading all steps into memory.
+type MoleculeProgressStats struct {
+	MoleculeID    string     `json:"molecule_id"`
+	MoleculeTitle string     `json:"molecule_title"`
+	Total         int        `json:"total"`           // Total steps (direct children)
+	Completed     int        `json:"completed"`       // Closed steps
+	InProgress    int        `json:"in_progress"`     // Steps currently in progress
+	CurrentStepID string     `json:"current_step_id"` // First in_progress step ID (if any)
+	FirstClosed   *time.Time `json:"first_closed,omitempty"`
+	LastClosed    *time.Time `json:"last_closed,omitempty"`
+}
+
 // Statistics provides aggregate metrics
 type Statistics struct {
 	TotalIssues              int     `json:"total_issues"`
@@ -702,8 +892,9 @@ type IssueFilter struct {
 	LabelsAny   []string  // OR semantics: issue must have AT LEAST ONE of these labels
 	TitleSearch string
 	IDs         []string  // Filter by specific issue IDs
+	IDPrefix    string    // Filter by ID prefix (e.g., "bd-" to match "bd-abc123")
 	Limit       int
-	
+
 	// Pattern matching
 	TitleContains       string
 	DescriptionContains string
@@ -746,6 +937,17 @@ type IssueFilter struct {
 
 	// Status exclusion (for default non-closed behavior)
 	ExcludeStatus []Status // Exclude issues with these statuses
+
+	// Type exclusion (for hiding internal types like gates)
+	ExcludeTypes []IssueType // Exclude issues with these types
+
+	// Time-based scheduling filters (GH#820)
+	Deferred    bool       // Filter issues with defer_until set (any value)
+	DeferAfter  *time.Time // Filter issues with defer_until > this time
+	DeferBefore *time.Time // Filter issues with defer_until < this time
+	DueAfter    *time.Time // Filter issues with due_at > this time
+	DueBefore   *time.Time // Filter issues with due_at < this time
+	Overdue     bool       // Filter issues where due_at < now AND status != closed
 }
 
 // SortPolicy determines how ready work is ordered
@@ -793,6 +995,9 @@ type WorkFilter struct {
 
 	// Molecule type filtering
 	MolType *MolType // Filter by molecule type (nil = any, swarm/patrol/work)
+
+	// Time-based deferral filtering (GH#820)
+	IncludeDeferred bool // If true, include issues with future defer_until timestamps
 }
 
 // StaleFilter is used to filter stale issue queries

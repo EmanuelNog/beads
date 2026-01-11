@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -18,16 +19,16 @@ import (
 // at startup, not from SQLite).
 var YamlOnlyKeys = map[string]bool{
 	// Bootstrap flags (affect how bd starts)
-	"no-db":          true,
-	"no-daemon":      true,
-	"no-auto-flush":  true,
-	"no-auto-import": true,
-	"json":           true,
+	"no-db":             true,
+	"no-daemon":         true,
+	"no-auto-flush":     true,
+	"no-auto-import":    true,
+	"json":              true,
 	"auto-start-daemon": true,
 
 	// Database and identity
-	"db":     true,
-	"actor":  true,
+	"db":       true,
+	"actor":    true,
 	"identity": true,
 
 	// Timing settings
@@ -36,15 +37,20 @@ var YamlOnlyKeys = map[string]bool{
 	"remote-sync-interval": true,
 
 	// Git settings
-	"git.author":       true,
-	"git.no-gpg-sign":  true,
-	"no-push":          true,
-	"no-git-ops":       true, // Disable git ops in bd prime session close protocol (GH#593)
+	"git.author":      true,
+	"git.no-gpg-sign": true,
+	"no-push":         true,
+	"no-git-ops":      true, // Disable git ops in bd prime session close protocol (GH#593)
 
 	// Sync settings
-	"sync-branch":                           true,
-	"sync.branch":                           true,
+	"sync-branch": true,
+	"sync.branch": true,
 	"sync.require_confirmation_on_mass_delete": true,
+
+	// Daemon settings (GH#871: team-wide auto-sync config)
+	"daemon.auto_commit": true,
+	"daemon.auto_push":   true,
+	"daemon.auto_pull":   true,
 
 	// Routing settings
 	"routing.mode":        true,
@@ -54,6 +60,14 @@ var YamlOnlyKeys = map[string]bool{
 
 	// Create command settings
 	"create.require-description": true,
+
+	// Validation settings (bd-t7jq)
+	// Values: "warn" | "error" | "none"
+	"validation.on-create": true,
+	"validation.on-sync":   true,
+
+	// Hierarchy settings (GH#995)
+	"hierarchy.max-depth": true,
 }
 
 // IsYamlOnlyKey returns true if the given key should be stored in config.yaml
@@ -65,7 +79,7 @@ func IsYamlOnlyKey(key string) bool {
 	}
 
 	// Check prefix matches for nested keys
-	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects."}
+	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects.", "validation.", "daemon.", "hierarchy."}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(key, prefix) {
 			return true
@@ -95,6 +109,11 @@ func normalizeYamlKey(key string) string {
 // It handles both adding new keys and updating existing (possibly commented) keys.
 // Keys are normalized to their canonical yaml format (e.g., sync.branch -> sync-branch).
 func SetYamlConfig(key, value string) error {
+	// Validate specific keys (GH#995)
+	if err := validateYamlConfigValue(key, value); err != nil {
+		return err
+	}
+
 	configPath, err := findProjectConfigYaml()
 	if err != nil {
 		return err
@@ -125,11 +144,13 @@ func SetYamlConfig(key, value string) error {
 
 // GetYamlConfig gets a configuration value from config.yaml.
 // Returns empty string if key is not found or is commented out.
+// Keys are normalized to their canonical yaml format (e.g., sync.branch -> sync-branch).
 func GetYamlConfig(key string) string {
 	if v == nil {
 		return ""
 	}
-	return v.GetString(key)
+	normalizedKey := normalizeYamlKey(key)
+	return v.GetString(normalizedKey)
 }
 
 // findProjectConfigYaml finds the project's .beads/config.yaml file.
@@ -261,4 +282,21 @@ func needsQuoting(s string) bool {
 		return true
 	}
 	return false
+}
+
+// validateYamlConfigValue validates a configuration value before setting.
+// Returns an error if the value is invalid for the given key.
+func validateYamlConfigValue(key, value string) error {
+	switch key {
+	case "hierarchy.max-depth":
+		// Must be a positive integer >= 1 (GH#995)
+		depth, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("hierarchy.max-depth must be a positive integer, got %q", value)
+		}
+		if depth < 1 {
+			return fmt.Errorf("hierarchy.max-depth must be at least 1, got %d", depth)
+		}
+	}
+	return nil
 }

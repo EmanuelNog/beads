@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -280,6 +281,39 @@ func TestDaemonAutostart_StartDaemonProcess_Stubbed(t *testing.T) {
 	}
 }
 
+func TestDaemonAutostart_StartDaemonProcess_NoGitRepo(t *testing.T) {
+	// Test that startDaemonProcess returns false immediately when not in a git repo
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldDir)
+	}()
+
+	// Change to a temp directory that is NOT a git repo
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+
+	// Capture stderr to verify the message
+	output := captureStderr(t, func() {
+		result := startDaemonProcess(filepath.Join(tmpDir, "bd.sock"))
+		if result {
+			t.Errorf("expected startDaemonProcess to return false when not in git repo")
+		}
+	})
+
+	// Verify the correct message is shown
+	if !strings.Contains(output, "No git repository initialized") {
+		t.Errorf("expected output to contain 'No git repository initialized', got: %q", output)
+	}
+	if !strings.Contains(output, "running without background sync") {
+		t.Errorf("expected output to contain 'running without background sync', got: %q", output)
+	}
+}
+
 func TestDaemonAutostart_RestartDaemonForVersionMismatch_Stubbed(t *testing.T) {
 	oldExec := execCommandFn
 	oldWait := waitForSocketReadinessFn
@@ -306,6 +340,11 @@ func TestDaemonAutostart_RestartDaemonForVersionMismatch_Stubbed(t *testing.T) {
 		t.Fatalf("getPIDFilePath: %v", err)
 	}
 	sock := getSocketPath()
+	// Create socket directory if needed (GH#1001 - socket may be in /tmp/beads-{hash}/)
+	sockDir := filepath.Dir(sock)
+	if err := os.MkdirAll(sockDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll sockDir: %v", err)
+	}
 	if err := os.WriteFile(pidFile, []byte("999999\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile pid: %v", err)
 	}
@@ -383,32 +422,45 @@ func TestIsWispOperation(t *testing.T) {
 		{
 			name:     "mol burn",
 			cmdNames: []string{"bd", "mol", "burn"},
-			args:     []string{"bd-eph-abc"},
+			args:     []string{"bd-wisp-abc"},
 			want:     true,
 		},
 		{
 			name:     "mol squash",
 			cmdNames: []string{"bd", "mol", "squash"},
-			args:     []string{"bd-eph-abc"},
+			args:     []string{"bd-wisp-abc"},
 			want:     true,
 		},
-		// Ephemeral issue IDs in args
+		// Ephemeral issue IDs in args (wisp-* pattern)
 		{
-			name:     "close with bd-eph ID",
+			name:     "close with bd-wisp ID",
+			cmdNames: []string{"bd", "close"},
+			args:     []string{"bd-wisp-abc123"},
+			want:     true,
+		},
+		{
+			name:     "show with gt-wisp ID",
+			cmdNames: []string{"bd", "show"},
+			args:     []string{"gt-wisp-xyz"},
+			want:     true,
+		},
+		{
+			name:     "update with wisp- prefix",
+			cmdNames: []string{"bd", "update"},
+			args:     []string{"wisp-test", "--status=closed"},
+			want:     true,
+		},
+		// Legacy eph-* pattern (backwards compatibility)
+		{
+			name:     "close with legacy bd-eph ID",
 			cmdNames: []string{"bd", "close"},
 			args:     []string{"bd-eph-abc123"},
 			want:     true,
 		},
 		{
-			name:     "show with gt-eph ID",
+			name:     "show with legacy gt-eph ID",
 			cmdNames: []string{"bd", "show"},
 			args:     []string{"gt-eph-xyz"},
-			want:     true,
-		},
-		{
-			name:     "update with eph- prefix",
-			cmdNames: []string{"bd", "update"},
-			args:     []string{"eph-test", "--status=closed"},
 			want:     true,
 		},
 		// Non-wisp operations (should NOT bypass)
@@ -438,9 +490,9 @@ func TestIsWispOperation(t *testing.T) {
 		},
 		// Edge cases
 		{
-			name:     "flag that looks like eph ID should be ignored",
+			name:     "flag that looks like wisp ID should be ignored",
 			cmdNames: []string{"bd", "show"},
-			args:     []string{"--format=bd-eph-style", "bd-regular"},
+			args:     []string{"--format=bd-wisp-style", "bd-regular"},
 			want:     false,
 		},
 	}

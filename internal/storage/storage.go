@@ -50,7 +50,7 @@ type Transaction interface {
 	CreateIssue(ctx context.Context, issue *types.Issue, actor string) error
 	CreateIssues(ctx context.Context, issues []*types.Issue, actor string) error
 	UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error
-	CloseIssue(ctx context.Context, id string, reason string, actor string) error
+	CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error
 	DeleteIssue(ctx context.Context, id string) error
 	GetIssue(ctx context.Context, id string) (*types.Issue, error)                                  // For read-your-writes within transaction
 	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) // For read-your-writes within transaction
@@ -83,7 +83,7 @@ type Storage interface {
 	GetIssue(ctx context.Context, id string) (*types.Issue, error)
 	GetIssueByExternalRef(ctx context.Context, externalRef string) (*types.Issue, error)
 	UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error
-	CloseIssue(ctx context.Context, id string, reason string, actor string) error
+	CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error
 	DeleteIssue(ctx context.Context, id string) error
 	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error)
 
@@ -110,6 +110,7 @@ type Storage interface {
 	// Ready Work & Blocking
 	GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error)
 	GetBlockedIssues(ctx context.Context, filter types.WorkFilter) ([]*types.BlockedIssue, error)
+	IsBlocked(ctx context.Context, issueID string) (bool, []string, error) // GH#962: Check if issue has open blockers
 	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
 	GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error)
 	GetNewlyUnblockedByClose(ctx context.Context, closedIssueID string) ([]*types.Issue, error) // GH#679
@@ -125,6 +126,9 @@ type Storage interface {
 
 	// Statistics
 	GetStatistics(ctx context.Context) (*types.Statistics, error)
+
+	// Molecule progress (efficient for large molecules)
+	GetMoleculeProgress(ctx context.Context, moleculeID string) (*types.MoleculeProgressStats, error)
 
 	// Dirty tracking (for incremental JSONL export)
 	GetDirtyIssues(ctx context.Context) ([]string, error)
@@ -149,6 +153,7 @@ type Storage interface {
 	GetAllConfig(ctx context.Context) (map[string]string, error)
 	DeleteConfig(ctx context.Context, key string) error
 	GetCustomStatuses(ctx context.Context) ([]string, error) // Custom status states from status.custom config
+	GetCustomTypes(ctx context.Context) ([]string, error)    // Custom issue types from types.custom config
 
 	// Metadata (for internal state like import hashes)
 	SetMetadata(ctx context.Context, key, value string) error

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -21,14 +22,14 @@ type MemoryStorage struct {
 	mu sync.RWMutex // Protects all maps
 
 	// Core data
-	issues       map[string]*types.Issue       // ID -> Issue
+	issues       map[string]*types.Issue        // ID -> Issue
 	dependencies map[string][]*types.Dependency // IssueID -> Dependencies
-	labels       map[string][]string           // IssueID -> Labels
-	events       map[string][]*types.Event     // IssueID -> Events
-	comments     map[string][]*types.Comment   // IssueID -> Comments
-	config       map[string]string             // Config key-value pairs
-	metadata     map[string]string             // Metadata key-value pairs
-	counters     map[string]int                // Prefix -> Last ID
+	labels       map[string][]string            // IssueID -> Labels
+	events       map[string][]*types.Event      // IssueID -> Events
+	comments     map[string][]*types.Comment    // IssueID -> Comments
+	config       map[string]string              // Config key-value pairs
+	metadata     map[string]string              // Metadata key-value pairs
+	counters     map[string]int                 // Prefix -> Last ID
 
 	// Indexes for O(1) lookups
 	externalRefToID map[string]string // ExternalRef -> IssueID
@@ -443,6 +444,14 @@ func (m *MemoryStorage) UpdateIssue(ctx context.Context, id string, updates map[
 				}
 				issue.ExternalRef = nil
 			}
+		case "close_reason":
+			if v, ok := value.(string); ok {
+				issue.CloseReason = v
+			}
+		case "closed_by_session":
+			if v, ok := value.(string); ok {
+				issue.ClosedBySession = v
+			}
 		}
 	}
 
@@ -467,11 +476,52 @@ func (m *MemoryStorage) UpdateIssue(ctx context.Context, id string, updates map[
 	return nil
 }
 
-// CloseIssue closes an issue with a reason
-func (m *MemoryStorage) CloseIssue(ctx context.Context, id string, reason string, actor string) error {
-	return m.UpdateIssue(ctx, id, map[string]interface{}{
-		"status": string(types.StatusClosed),
-	}, actor)
+// CloseIssue closes an issue with a reason.
+// The session parameter tracks which Claude Code session closed the issue (can be empty).
+func (m *MemoryStorage) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
+	updates := map[string]interface{}{
+		"status":       string(types.StatusClosed),
+		"close_reason": reason,
+	}
+	if session != "" {
+		updates["closed_by_session"] = session
+	}
+	return m.UpdateIssue(ctx, id, updates, actor)
+}
+
+// CreateTombstone converts an existing issue to a tombstone record.
+// This is a soft-delete that preserves the issue with status="tombstone".
+func (m *MemoryStorage) CreateTombstone(ctx context.Context, id string, actor string, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	issue, ok := m.issues[id]
+	if !ok {
+		return fmt.Errorf("issue not found: %s", id)
+	}
+
+	now := time.Now()
+	issue.OriginalType = string(issue.IssueType)
+	issue.Status = types.StatusTombstone
+	issue.DeletedAt = &now
+	issue.DeletedBy = actor
+	issue.DeleteReason = reason
+	issue.UpdatedAt = now
+
+	// Mark as dirty for export
+	m.dirty[id] = true
+
+	// Record tombstone creation event
+	event := &types.Event{
+		IssueID:   id,
+		EventType: "deleted",
+		Actor:     actor,
+		Comment:   &reason,
+		CreatedAt: now,
+	}
+	m.events[id] = append(m.events[id], event)
+
+	return nil
 }
 
 // DeleteIssue permanently deletes an issue and all associated data
@@ -567,6 +617,13 @@ func (m *MemoryStorage) SearchIssues(ctx context.Context, query string, filter t
 				}
 			}
 			if !found {
+				continue
+			}
+		}
+
+		// ID prefix filtering (for shell completion)
+		if filter.IDPrefix != "" {
+			if !strings.HasPrefix(issue.ID, filter.IDPrefix) {
 				continue
 			}
 		}
@@ -838,19 +895,43 @@ func (m *MemoryStorage) SetJSONLFileHash(ctx context.Context, fileHash string) e
 
 // GetDependencyTree gets the dependency tree for an issue
 func (m *MemoryStorage) GetDependencyTree(ctx context.Context, issueID string, maxDepth int, showAllPaths bool, reverse bool) ([]*types.TreeNode, error) {
-	// Simplified implementation - just return direct dependencies
-	// Note: reverse parameter is accepted for interface compatibility but not fully implemented in memory storage
+	// Get the root issue first
+	root, err := m.GetIssue(ctx, issueID)
+	if err != nil {
+		return nil, err
+	}
+	if root == nil {
+		return nil, nil
+	}
+
+	var nodes []*types.TreeNode
+
+	// Add root node at depth 0
+	rootNode := &types.TreeNode{
+		Depth:    0,
+		ParentID: issueID, // Root's parent is itself
+	}
+	rootNode.ID = root.ID
+	rootNode.Title = root.Title
+	rootNode.Description = root.Description
+	rootNode.Status = root.Status
+	rootNode.Priority = root.Priority
+	rootNode.IssueType = root.IssueType
+	nodes = append(nodes, rootNode)
+
+	// Get dependencies (or dependents if reverse)
+	// Note: reverse mode not fully implemented - uses same logic for now
 	deps, err := m.GetDependencies(ctx, issueID)
 	if err != nil {
 		return nil, err
 	}
 
-	var nodes []*types.TreeNode
+	// Add dependencies at depth 1
 	for _, dep := range deps {
 		node := &types.TreeNode{
-			Depth: 1,
+			Depth:    1,
+			ParentID: issueID, // Parent is the root
 		}
-		// Copy issue fields
 		node.ID = dep.ID
 		node.Title = dep.Title
 		node.Description = dep.Description
@@ -1203,6 +1284,19 @@ func (m *MemoryStorage) GetBlockedIssues(ctx context.Context, filter types.WorkF
 	return results, nil
 }
 
+// IsBlocked checks if an issue is blocked by open dependencies (GH#962).
+// Returns true if the issue has open blockers, along with the list of blocker IDs.
+func (m *MemoryStorage) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	blockers := m.getOpenBlockers(issueID)
+	if len(blockers) == 0 {
+		return false, nil, nil
+	}
+	return true, blockers, nil
+}
+
 // getAllDescendants returns all descendant IDs of a parent issue recursively
 func (m *MemoryStorage) getAllDescendants(parentID string) map[string]bool {
 	descendants := make(map[string]bool)
@@ -1505,10 +1599,9 @@ func (m *MemoryStorage) GetNextChildID(ctx context.Context, parentID string) (st
 		return "", fmt.Errorf("parent issue %s does not exist", parentID)
 	}
 
-	// Calculate depth (count dots)
-	depth := strings.Count(parentID, ".")
-	if depth >= 3 {
-		return "", fmt.Errorf("maximum hierarchy depth (3) exceeded for parent %s", parentID)
+	// Check hierarchy depth limit (GH#995)
+	if err := types.CheckHierarchyDepth(parentID, config.GetInt("hierarchy.max-depth")); err != nil {
+		return "", err
 	}
 
 	// Get or initialize counter for this parent
@@ -1586,6 +1679,18 @@ func parseCustomStatuses(value string) []string {
 	return result
 }
 
+// GetCustomTypes retrieves the list of custom issue types from config.
+func (m *MemoryStorage) GetCustomTypes(ctx context.Context) ([]string, error) {
+	value, err := m.GetConfig(ctx, "types.custom")
+	if err != nil {
+		return nil, err
+	}
+	if value == "" {
+		return nil, nil
+	}
+	return parseCustomStatuses(value), nil
+}
+
 // Metadata
 func (m *MemoryStorage) SetMetadata(ctx context.Context, key, value string) error {
 	m.mu.Lock()
@@ -1626,6 +1731,55 @@ func (m *MemoryStorage) Close() error {
 
 func (m *MemoryStorage) Path() string {
 	return m.jsonlPath
+}
+
+// GetMoleculeProgress returns progress stats for a molecule.
+// For memory storage, this iterates through dependencies.
+func (m *MemoryStorage) GetMoleculeProgress(ctx context.Context, moleculeID string) (*types.MoleculeProgressStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	issue, exists := m.issues[moleculeID]
+	if !exists {
+		return nil, fmt.Errorf("molecule not found: %s", moleculeID)
+	}
+
+	stats := &types.MoleculeProgressStats{
+		MoleculeID:    moleculeID,
+		MoleculeTitle: issue.Title,
+	}
+
+	// Find all parent-child dependencies where moleculeID is the parent
+	for _, deps := range m.dependencies {
+		for _, dep := range deps {
+			if dep.Type == types.DepParentChild && dep.DependsOnID == moleculeID {
+				child, exists := m.issues[dep.IssueID]
+				if !exists {
+					continue
+				}
+				stats.Total++
+				switch child.Status {
+				case types.StatusClosed:
+					stats.Completed++
+					if child.ClosedAt != nil {
+						if stats.FirstClosed == nil || child.ClosedAt.Before(*stats.FirstClosed) {
+							stats.FirstClosed = child.ClosedAt
+						}
+						if stats.LastClosed == nil || child.ClosedAt.After(*stats.LastClosed) {
+							stats.LastClosed = child.ClosedAt
+						}
+					}
+				case types.StatusInProgress:
+					stats.InProgress++
+					if stats.CurrentStepID == "" {
+						stats.CurrentStepID = child.ID
+					}
+				}
+			}
+		}
+	}
+
+	return stats, nil
 }
 
 // UnderlyingDB returns nil for memory storage (no SQL database)

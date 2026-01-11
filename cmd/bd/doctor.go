@@ -342,19 +342,39 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, configValuesCheck)
 	// Don't fail overall check for config value warnings, just warn
 
-	// Check 7b: JSONL integrity (malformed lines, missing IDs)
+	// Check 7b: Multi-repo custom types discovery (bd-9ji4z)
+	multiRepoTypesCheck := convertWithCategory(doctor.CheckMultiRepoTypes(path), doctor.CategoryData)
+	result.Checks = append(result.Checks, multiRepoTypesCheck)
+	// Don't fail overall check for multi-repo types, just informational
+
+	// Check 7c: JSONL integrity (malformed lines, missing IDs)
 	jsonlIntegrityCheck := convertWithCategory(doctor.CheckJSONLIntegrity(path), doctor.CategoryData)
 	result.Checks = append(result.Checks, jsonlIntegrityCheck)
 	if jsonlIntegrityCheck.Status == statusWarning || jsonlIntegrityCheck.Status == statusError {
 		result.OverallOK = false
 	}
 
-	// Check 8: Daemon health
+	// Check 8a: Git sync setup (informational - explains why daemon might not start)
+	gitSyncCheck := convertWithCategory(doctor.CheckGitSyncSetup(path), doctor.CategoryRuntime)
+	result.Checks = append(result.Checks, gitSyncCheck)
+	// Don't fail overall check for git sync warning - beads works fine without git
+
+	// Check 8b: Daemon health
 	daemonCheck := convertWithCategory(doctor.CheckDaemonStatus(path, Version), doctor.CategoryRuntime)
 	result.Checks = append(result.Checks, daemonCheck)
 	if daemonCheck.Status == statusWarning || daemonCheck.Status == statusError {
 		result.OverallOK = false
 	}
+
+	// Check 8b: Daemon auto-sync (only warn, don't fail overall)
+	autoSyncCheck := convertWithCategory(doctor.CheckDaemonAutoSync(path), doctor.CategoryRuntime)
+	result.Checks = append(result.Checks, autoSyncCheck)
+	// Note: Don't set OverallOK = false for this - it's a performance hint, not a failure
+
+	// Check 8c: Legacy daemon config (warn about deprecated options)
+	legacyDaemonConfigCheck := convertWithCategory(doctor.CheckLegacyDaemonConfig(path), doctor.CategoryRuntime)
+	result.Checks = append(result.Checks, legacyDaemonConfigCheck)
+	// Note: Don't set OverallOK = false for this - deprecated options still work
 
 	// Check 9: Database-JSONL sync
 	syncCheck := convertWithCategory(doctor.CheckDatabaseJSONLSync(path), doctor.CategoryData)
@@ -362,6 +382,14 @@ func runDiagnostics(path string) doctorResult {
 	if syncCheck.Status == statusWarning || syncCheck.Status == statusError {
 		result.OverallOK = false
 	}
+
+	// Check 9a: Sync divergence (JSONL/SQLite/git) - GH#885
+	syncDivergenceCheck := convertWithCategory(doctor.CheckSyncDivergence(path), doctor.CategoryData)
+	result.Checks = append(result.Checks, syncDivergenceCheck)
+	if syncDivergenceCheck.Status == statusError {
+		result.OverallOK = false
+	}
+	// Warning-level divergence is informational, doesn't fail overall
 
 	// Check 9: Permissions
 	permCheck := convertWithCategory(doctor.CheckPermissions(path), doctor.CategoryCore)
@@ -381,6 +409,11 @@ func runDiagnostics(path string) doctorResult {
 	claudeCheck := convertWithCategory(doctor.CheckClaude(), doctor.CategoryIntegration)
 	result.Checks = append(result.Checks, claudeCheck)
 	// Don't fail overall check for missing Claude integration, just warn
+
+	// Check 11b: Gemini CLI integration
+	geminiCheck := convertWithCategory(doctor.CheckGemini(), doctor.CategoryIntegration)
+	result.Checks = append(result.Checks, geminiCheck)
+	// Don't fail overall check for missing Gemini integration, just info
 
 	// Check 11a: bd in PATH (needed for Claude hooks to work)
 	bdPathCheck := convertWithCategory(doctor.CheckBdInPath(), doctor.CategoryIntegration)
@@ -411,6 +444,26 @@ func runDiagnostics(path string) doctorResult {
 	issuesTrackingCheck := convertWithCategory(doctor.CheckIssuesTracking(), doctor.CategoryGit)
 	result.Checks = append(result.Checks, issuesTrackingCheck)
 	// Don't fail overall check for tracking issues, just warn
+
+	// Check 14b: redirect file tracking (worktree redirect files shouldn't be committed)
+	redirectTrackingCheck := convertWithCategory(doctor.CheckRedirectNotTracked(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, redirectTrackingCheck)
+	// Don't fail overall check for redirect tracking, just warn
+
+	// Check 14c: redirect target validity (target exists and has valid db)
+	redirectTargetCheck := convertWithCategory(doctor.CheckRedirectTargetValid(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, redirectTargetCheck)
+	// Don't fail overall check for redirect target, just warn
+
+	// Check 14d: redirect target sync worktree (target has beads-sync if needed)
+	redirectTargetSyncCheck := convertWithCategory(doctor.CheckRedirectTargetSyncWorktree(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, redirectTargetSyncCheck)
+	// Don't fail overall check for redirect target sync, just warn
+
+	// Check 14e: vestigial sync worktrees (unused worktrees in redirected repos)
+	vestigialWorktreesCheck := convertWithCategory(doctor.CheckNoVestigialSyncWorktrees(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, vestigialWorktreesCheck)
+	// Don't fail overall check for vestigial worktrees, just warn
 
 	// Check 15: Git merge driver configuration
 	mergeDriverCheck := convertWithCategory(doctor.CheckMergeDriver(path), doctor.CategoryGit)
@@ -446,6 +499,11 @@ func runDiagnostics(path string) doctorResult {
 	orphanedIssuesCheck := convertWithCategory(doctor.CheckOrphanedIssues(path), doctor.CategoryGit)
 	result.Checks = append(result.Checks, orphanedIssuesCheck)
 	// Don't fail overall check for orphaned issues, just warn
+
+	// Check 17c: Sync branch gitignore flags (GH#870)
+	syncBranchGitignoreCheck := convertWithCategory(doctor.CheckSyncBranchGitignore(), doctor.CategoryGit)
+	result.Checks = append(result.Checks, syncBranchGitignoreCheck)
+	// Don't fail overall check for sync branch gitignore, just warn
 
 	// Check 18: Deletions manifest (legacy, now replaced by tombstones)
 	deletionsCheck := convertWithCategory(doctor.CheckDeletionsManifest(path), doctor.CategoryMetadata)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/lockfile"
 	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 // walkWithDepth walks a directory tree with depth limiting
@@ -213,12 +214,25 @@ func FindDaemonByWorkspace(workspacePath string) (*DaemonInfo, error) {
 	// For worktrees, .beads is in the main repository root, not the worktree
 	beadsDir := findBeadsDirForWorkspace(workspacePath)
 
-	// First try the socket in the determined .beads directory
-	socketPath := filepath.Join(beadsDir, "bd.sock")
-	if _, err := os.Stat(socketPath); err == nil {
-		daemon := discoverDaemon(socketPath)
+	// Try short socket path first (GH#1001 - avoids macOS 104-char limit)
+	// This is computed from the workspace path, not the beads dir
+	mainWorkspace := filepath.Dir(beadsDir) // Get workspace from .beads dir
+	shortSocketPath := rpc.ShortSocketPath(mainWorkspace)
+	if _, err := os.Stat(shortSocketPath); err == nil {
+		daemon := discoverDaemon(shortSocketPath)
 		if daemon.Alive {
 			return &daemon, nil
+		}
+	}
+
+	// Try legacy socket path in .beads directory (backwards compatibility)
+	legacySocketPath := filepath.Join(beadsDir, "bd.sock")
+	if legacySocketPath != shortSocketPath {
+		if _, err := os.Stat(legacySocketPath); err == nil {
+			daemon := discoverDaemon(legacySocketPath)
+			if daemon.Alive {
+				return &daemon, nil
+			}
 		}
 	}
 
@@ -229,7 +243,8 @@ func FindDaemonByWorkspace(workspacePath string) (*DaemonInfo, error) {
 	}
 
 	for _, daemon := range daemons {
-		if daemon.WorkspacePath == workspacePath && daemon.Alive {
+		// Use PathsEqual for case-insensitive comparison on macOS/Windows (GH#869)
+		if utils.PathsEqual(daemon.WorkspacePath, workspacePath) && daemon.Alive {
 			return &daemon, nil
 		}
 	}
@@ -409,9 +424,9 @@ func stopDaemonWithTimeout(daemon DaemonInfo) error {
 		}
 	}
 
-	// Try SIGTERM with 3 second timeout
+	// Try graceful kill with 3 second timeout
 	if err := killProcess(daemon.PID); err != nil {
-		return fmt.Errorf("SIGTERM failed: %w", err)
+		return fmt.Errorf("kill process failed: %w", err)
 	}
 
 	// Wait up to 3 seconds for process to die
@@ -422,9 +437,9 @@ func stopDaemonWithTimeout(daemon DaemonInfo) error {
 		}
 	}
 
-	// SIGTERM timeout, try SIGKILL with 1 second timeout
+	// Graceful kill timeout, try force kill with 1 second timeout
 	if err := forceKillProcess(daemon.PID); err != nil {
-		return fmt.Errorf("SIGKILL failed: %w", err)
+		return fmt.Errorf("force kill failed: %w", err)
 	}
 
 	// Wait up to 1 second for process to die
@@ -435,5 +450,5 @@ func stopDaemonWithTimeout(daemon DaemonInfo) error {
 		}
 	}
 
-	return fmt.Errorf("process %d did not die after SIGKILL", daemon.PID)
+	return fmt.Errorf("process %d did not die after force kill", daemon.PID)
 }

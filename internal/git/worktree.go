@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/merge"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 // WorktreeManager handles git worktree lifecycle for separate beads branches
@@ -93,6 +94,13 @@ func (wm *WorktreeManager) CreateBeadsWorktree(branch, worktreePath string) erro
 		_ = wm.RemoveBeadsWorktree(worktreePath)
 		return fmt.Errorf("failed to checkout branch in worktree: %w\nOutput: %s", err, string(output))
 	}
+
+	// GH#886: Git 2.38+ enables sparse checkout on the main repo as a side effect
+	// of worktree creation. Explicitly disable it to prevent confusing git status
+	// message: "You are in a sparse checkout with 100% of tracked files present."
+	disableSparseCmd := exec.Command("git", "config", "core.sparseCheckout", "false")
+	disableSparseCmd.Dir = wm.repoPath
+	_ = disableSparseCmd.Run() // Best effort - don't fail if this doesn't work
 
 	return nil
 }
@@ -185,10 +193,10 @@ func (wm *WorktreeManager) SyncJSONLToWorktreeWithOptions(worktreePath, jsonlRel
 	srcPath := filepath.Join(wm.repoPath, jsonlRelPath)
 
 	// Destination: worktree JSONL
-	// GH#785: Handle bare repo worktrees where jsonlRelPath might include the
+	// GH#785, GH#810: Handle bare repo worktrees where jsonlRelPath might include the
 	// worktree name (e.g., "main/.beads/issues.jsonl"). The sync branch uses
 	// sparse checkout for .beads/* so we normalize to strip leading components.
-	normalizedRelPath := normalizeBeadsRelPath(jsonlRelPath)
+	normalizedRelPath := NormalizeBeadsRelPath(jsonlRelPath)
 	dstPath := filepath.Join(worktreePath, normalizedRelPath)
 
 	// Ensure destination directory exists
@@ -320,22 +328,6 @@ func (wm *WorktreeManager) mergeJSONLFiles(srcData, dstData []byte) ([]byte, err
 	return mergedData, nil
 }
 
-
-// normalizeBeadsRelPath strips any leading path components before .beads/.
-// This handles bare repo worktrees where the relative path includes the worktree
-// name (e.g., "main/.beads/issues.jsonl" -> ".beads/issues.jsonl").
-// GH#785: Fix for sync failing across worktrees in bare repo setup.
-func normalizeBeadsRelPath(relPath string) string {
-	// Use filepath.ToSlash for consistent handling across platforms
-	normalized := filepath.ToSlash(relPath)
-	// Look for ".beads/" to ensure we match the directory, not a prefix like ".beads-backup"
-	if idx := strings.Index(normalized, ".beads/"); idx > 0 {
-		// Strip leading path components before .beads
-		return filepath.FromSlash(normalized[idx:])
-	}
-	return relPath
-}
-
 // isValidWorktree checks if the path is a valid git worktree
 func (wm *WorktreeManager) isValidWorktree(worktreePath string) (bool, error) {
 	cmd := exec.Command("git", "worktree", "list", "--porcelain")
@@ -369,7 +361,8 @@ func (wm *WorktreeManager) isValidWorktree(worktreePath string) (bool, error) {
 					continue
 				}
 			}
-			if absPath == absWorktreePath {
+			// Use PathsEqual to handle case-insensitive filesystems (macOS/Windows)
+			if utils.PathsEqual(absPath, absWorktreePath) {
 				return true, nil
 			}
 		}
@@ -398,75 +391,56 @@ func (wm *WorktreeManager) branchExists(branch string) bool {
 }
 
 // configureSparseCheckout sets up sparse checkout to only include .beads/
+// Uses `git sparse-checkout` command which properly scopes the config to the
+// worktree, avoiding GH#886 where core.sparseCheckout leaked to main repo.
 func (wm *WorktreeManager) configureSparseCheckout(worktreePath string) error {
-	// Get the actual git directory (for worktrees, .git is a file)
-	gitFile := filepath.Join(worktreePath, ".git")
-	gitContent, err := os.ReadFile(gitFile) // #nosec G304 - controlled path
+	// Initialize sparse checkout in non-cone mode (supports glob patterns)
+	// This uses extensions.worktreeConfig to scope sparseCheckout to this worktree only
+	initCmd := exec.Command("git", "sparse-checkout", "init", "--no-cone")
+	initCmd.Dir = worktreePath
+	output, err := initCmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to read .git file: %w", err)
+		return fmt.Errorf("failed to init sparse checkout: %w\nOutput: %s", err, string(output))
 	}
 
-	// Parse "gitdir: /path/to/git/dir"
-	gitDirLine := strings.TrimSpace(string(gitContent))
-	if !strings.HasPrefix(gitDirLine, "gitdir: ") {
-		return fmt.Errorf("invalid .git file format: %s", gitDirLine)
-	}
-	gitDir := strings.TrimPrefix(gitDirLine, "gitdir: ")
-
-	// Enable sparse checkout config
-	cmd := exec.Command("git", "config", "core.sparseCheckout", "true")
-	cmd.Dir = worktreePath
-	output, err := cmd.CombinedOutput()
+	// Set sparse checkout to only include .beads/
+	setCmd := exec.Command("git", "sparse-checkout", "set", "/.beads/")
+	setCmd.Dir = worktreePath
+	output, err = setCmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to enable sparse checkout: %w\nOutput: %s", err, string(output))
-	}
-
-	// Create info directory if it doesn't exist
-	infoDir := filepath.Join(gitDir, "info")
-	if err := os.MkdirAll(infoDir, 0750); err != nil {
-		return fmt.Errorf("failed to create info directory: %w", err)
-	}
-
-	// Write sparse-checkout file to include only .beads/
-	sparseFile := filepath.Join(infoDir, "sparse-checkout")
-	sparseContent := ".beads/*\n"
-	if err := os.WriteFile(sparseFile, []byte(sparseContent), 0644); err != nil { // #nosec G306 - sparse-checkout config file needs standard permissions
-		return fmt.Errorf("failed to write sparse-checkout file: %w", err)
+		return fmt.Errorf("failed to set sparse checkout patterns: %w\nOutput: %s", err, string(output))
 	}
 
 	return nil
 }
 
+// NormalizeBeadsRelPath strips any leading path components before .beads/.
+// This handles bare repo worktrees where the relative path includes the worktree
+// name (e.g., "main/.beads/issues.jsonl" -> ".beads/issues.jsonl").
+// GH#785, GH#810: Fix for sync failing across worktrees in bare repo setup.
+func NormalizeBeadsRelPath(relPath string) string {
+	// Use filepath.ToSlash for consistent handling across platforms
+	normalized := filepath.ToSlash(relPath)
+	// Look for ".beads/" to ensure we match the directory, not a prefix like ".beads-backup"
+	if idx := strings.Index(normalized, ".beads/"); idx > 0 {
+		// Strip leading path components before .beads
+		return filepath.FromSlash(normalized[idx:])
+	}
+	return relPath
+}
+
 // verifySparseCheckout checks if sparse checkout is configured correctly
 func (wm *WorktreeManager) verifySparseCheckout(worktreePath string) error {
-	// Check if sparse-checkout file exists and contains .beads
-	sparseFile := filepath.Join(worktreePath, ".git", "info", "sparse-checkout")
-	
-	// For worktrees, .git is a file pointing to the actual git dir
-	// We need to read the actual git directory location
-	gitFile := filepath.Join(worktreePath, ".git")
-	gitContent, err := os.ReadFile(gitFile) // #nosec G304 - controlled path
+	// Use git sparse-checkout list to verify configuration
+	cmd := exec.Command("git", "sparse-checkout", "list")
+	cmd.Dir = worktreePath
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to read .git file: %w", err)
-	}
-
-	// Parse "gitdir: /path/to/git/dir"
-	gitDirLine := strings.TrimSpace(string(gitContent))
-	if !strings.HasPrefix(gitDirLine, "gitdir: ") {
-		return fmt.Errorf("invalid .git file format")
-	}
-	gitDir := strings.TrimPrefix(gitDirLine, "gitdir: ")
-	
-	// Sparse checkout file is in the git directory
-	sparseFile = filepath.Join(gitDir, "info", "sparse-checkout")
-	
-	data, err := os.ReadFile(sparseFile) // #nosec G304 - controlled path
-	if err != nil {
-		return fmt.Errorf("sparse-checkout file not found: %w", err)
+		return fmt.Errorf("failed to list sparse checkout patterns: %w\nOutput: %s", err, string(output))
 	}
 
 	// Verify it contains .beads
-	if !strings.Contains(string(data), ".beads") {
+	if !strings.Contains(string(output), ".beads") {
 		return fmt.Errorf("sparse-checkout does not include .beads")
 	}
 

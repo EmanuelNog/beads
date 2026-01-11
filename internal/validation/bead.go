@@ -72,10 +72,36 @@ func ValidateIDFormat(id string) (string, error) {
 // ValidatePrefix checks that the requested prefix matches the database prefix.
 // Returns an error if they don't match (unless force is true).
 func ValidatePrefix(requestedPrefix, dbPrefix string, force bool) error {
+	return ValidatePrefixWithAllowed(requestedPrefix, dbPrefix, "", force)
+}
+
+// ValidatePrefixWithAllowed checks that the requested prefix is allowed.
+// It matches if:
+// - force is true
+// - dbPrefix is empty
+// - requestedPrefix matches dbPrefix
+// - requestedPrefix is in the comma-separated allowedPrefixes list
+// Returns an error if none of these conditions are met.
+func ValidatePrefixWithAllowed(requestedPrefix, dbPrefix, allowedPrefixes string, force bool) error {
 	if force || dbPrefix == "" || dbPrefix == requestedPrefix {
 		return nil
 	}
 
+	// Check if requestedPrefix is in the allowed list
+	if allowedPrefixes != "" {
+		for _, allowed := range strings.Split(allowedPrefixes, ",") {
+			allowed = strings.TrimSpace(allowed)
+			if allowed == requestedPrefix {
+				return nil
+			}
+		}
+	}
+
+	// Build helpful error message
+	if allowedPrefixes != "" {
+		return fmt.Errorf("prefix mismatch: database uses '%s' (allowed: %s) but you specified '%s' (use --force to override)",
+			dbPrefix, allowedPrefixes, requestedPrefix)
+	}
 	return fmt.Errorf("prefix mismatch: database uses '%s' but you specified '%s' (use --force to override)", dbPrefix, requestedPrefix)
 }
 
@@ -141,87 +167,90 @@ func isNamedRole(s string) bool {
 // ValidateAgentID validates that an agent ID follows the expected pattern.
 // Canonical format: prefix-rig-role-name
 // Patterns:
-//   - Town-level: gt-<role> (e.g., gt-mayor, gt-deacon)
-//   - Per-rig singleton: gt-<rig>-<role> (e.g., gt-gastown-witness)
-//   - Per-rig named: gt-<rig>-<role>-<name> (e.g., gt-gastown-polecat-nux)
+//   - Town-level: <prefix>-<role> (e.g., gt-mayor, bd-deacon)
+//   - Per-rig singleton: <prefix>-<rig>-<role> (e.g., gt-gastown-witness)
+//   - Per-rig named: <prefix>-<rig>-<role>-<name> (e.g., gt-gastown-polecat-nux)
 //
+// The prefix can be any rig's configured prefix (gt-, bd-, etc.).
+// Rig names may contain hyphens (e.g., my-project), so we parse by scanning
+// for known role tokens from the right side of the ID.
 // Returns nil if the ID is valid, or an error describing the issue.
 func ValidateAgentID(id string) error {
 	if id == "" {
 		return fmt.Errorf("agent ID is required")
 	}
 
-	// Must start with gt-
-	if !strings.HasPrefix(id, "gt-") {
-		return fmt.Errorf("agent ID must start with 'gt-' (got %q)", id)
+	// Must contain a hyphen to have a prefix
+	hyphenIdx := strings.Index(id, "-")
+	if hyphenIdx <= 0 {
+		return fmt.Errorf("agent ID must have a prefix followed by '-' (got %q)", id)
 	}
 
 	// Split into parts after the prefix
-	rest := id[3:] // Skip "gt-"
+	rest := id[hyphenIdx+1:] // Skip "<prefix>-"
 	parts := strings.Split(rest, "-")
 	if len(parts) < 1 || parts[0] == "" {
-		return fmt.Errorf("agent ID must include content after 'gt-' (got %q)", id)
+		return fmt.Errorf("agent ID must include content after prefix (got %q)", id)
 	}
 
-	// Case 1: Town-level roles (gt-mayor, gt-deacon)
+	// Case 1: Single part after prefix - must be town-level role
 	if len(parts) == 1 {
 		role := parts[0]
 		if isTownLevelRole(role) {
 			return nil // Valid town-level agent
 		}
 		if isValidRole(role) {
-			return fmt.Errorf("agent role %q requires rig: gt-<rig>-%s (got %q)", role, role, id)
+			return fmt.Errorf("agent role %q requires rig: <prefix>-<rig>-%s (got %q)", role, role, id)
 		}
 		return fmt.Errorf("invalid agent role %q (valid: %s)", role, strings.Join(ValidAgentRoles, ", "))
 	}
 
-	// Case 2: Rig-level roles (gt-<rig>-witness, gt-<rig>-refinery)
-	if len(parts) == 2 {
-		rig, role := parts[0], parts[1]
-
-		if isRigLevelRole(role) {
-			if rig == "" {
-				return fmt.Errorf("rig name cannot be empty in %q", id)
-			}
-			return nil // Valid rig-level singleton agent
+	// For 2+ parts, scan from the right to find a known role.
+	// This allows rig names to contain hyphens (e.g., "my-project").
+	roleIdx := -1
+	var role string
+	for i := len(parts) - 1; i >= 0; i-- {
+		if isValidRole(parts[i]) {
+			roleIdx = i
+			role = parts[i]
+			break
 		}
-
-		if isNamedRole(role) {
-			return fmt.Errorf("agent role %q requires name: gt-<rig>-%s-<name> (got %q)", role, role, id)
-		}
-
-		if isTownLevelRole(role) {
-			return fmt.Errorf("town-level agent %q cannot have rig suffix (expected gt-%s, got %q)", role, role, id)
-		}
-
-		// First part might be a rig name with second part being something invalid
-		return fmt.Errorf("invalid agent format: expected gt-<rig>-<role>[-<name>] where role is one of: %s (got %q)", strings.Join(ValidAgentRoles, ", "), id)
 	}
 
-	// Case 3: Named roles (gt-<rig>-crew-<name>, gt-<rig>-polecat-<name>)
-	if len(parts) >= 3 {
-		rig, role := parts[0], parts[1]
-		name := strings.Join(parts[2:], "-") // Allow hyphens in names
+	if roleIdx == -1 {
+		return fmt.Errorf("invalid agent format: no valid role found in %q (valid roles: %s)", id, strings.Join(ValidAgentRoles, ", "))
+	}
 
-		if isNamedRole(role) {
-			if rig == "" {
-				return fmt.Errorf("rig name cannot be empty in %q", id)
-			}
-			if name == "" {
-				return fmt.Errorf("agent name cannot be empty in %q", id)
-			}
-			return nil // Valid named agent
+	// Extract rig (everything before role) and name (everything after role)
+	rig := strings.Join(parts[:roleIdx], "-")
+	name := strings.Join(parts[roleIdx+1:], "-")
+
+	// Validate based on role type
+	if isTownLevelRole(role) {
+		if rig != "" || name != "" {
+			return fmt.Errorf("town-level agent %q cannot have rig/name suffixes (expected <prefix>-%s, got %q)", role, role, id)
 		}
+		return nil
+	}
 
-		if isRigLevelRole(role) {
-			return fmt.Errorf("agent role %q cannot have name suffix (expected gt-<rig>-%s, got %q)", role, role, id)
+	if isRigLevelRole(role) {
+		if rig == "" {
+			return fmt.Errorf("agent role %q requires rig: <prefix>-<rig>-%s (got %q)", role, role, id)
 		}
-
-		if isTownLevelRole(role) {
-			return fmt.Errorf("town-level agent %q cannot have rig/name suffixes (expected gt-%s, got %q)", role, role, id)
+		if name != "" {
+			return fmt.Errorf("agent role %q cannot have name suffix (expected <prefix>-<rig>-%s, got %q)", role, role, id)
 		}
+		return nil // Valid rig-level singleton agent
+	}
 
-		return fmt.Errorf("invalid agent format: expected gt-<rig>-<role>-<name> where role is one of: %s (got %q)", strings.Join(NamedRoles, ", "), id)
+	if isNamedRole(role) {
+		if rig == "" {
+			return fmt.Errorf("rig name cannot be empty in %q", id)
+		}
+		if name == "" {
+			return fmt.Errorf("agent role %q requires name: <prefix>-<rig>-%s-<name> (got %q)", role, role, id)
+		}
+		return nil // Valid named agent
 	}
 
 	return fmt.Errorf("invalid agent ID format: %q", id)

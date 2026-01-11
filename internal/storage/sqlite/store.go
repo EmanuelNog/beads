@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -20,6 +21,27 @@ import (
 	"github.com/tetratelabs/wazero"
 )
 
+// wslWindowsPathPattern matches WSL paths to Windows filesystems like /mnt/c/, /mnt/d/, etc.
+var wslWindowsPathPattern = regexp.MustCompile(`^/mnt/[a-zA-Z]/`)
+
+// isWSL2WindowsPath returns true if running under WSL2 and the path is on a Windows filesystem.
+// SQLite WAL mode doesn't work reliably across the WSL2/Windows boundary (GH#920).
+func isWSL2WindowsPath(path string) bool {
+	// Check if path looks like a Windows filesystem mounted in WSL (/mnt/c/, /mnt/d/, etc.)
+	if !wslWindowsPathPattern.MatchString(path) {
+		return false
+	}
+
+	// Check if we're running under WSL by examining /proc/version
+	// WSL2 contains "microsoft" or "WSL" in the version string
+	data, err := os.ReadFile("/proc/version")
+	if err != nil {
+		return false // Not Linux or can't read - not WSL
+	}
+	version := strings.ToLower(string(data))
+	return strings.Contains(version, "microsoft") || strings.Contains(version, "wsl")
+}
+
 // SQLiteStorage implements the Storage interface using SQLite
 type SQLiteStorage struct {
 	db          *sql.DB
@@ -27,6 +49,7 @@ type SQLiteStorage struct {
 	closed      atomic.Bool // Tracks whether Close() has been called
 	connStr     string      // Connection string for reconnection
 	busyTimeout time.Duration
+	readOnly    bool              // True if opened in read-only mode (GH#804)
 	freshness   *FreshnessChecker // Optional freshness checker for daemon mode
 	reconnectMu sync.RWMutex      // Protects reconnection and db access (GH#607)
 }
@@ -138,9 +161,15 @@ func NewWithTimeout(ctx context.Context, path string, busyTimeout time.Duration)
 	}
 
 	// For file-based databases, enable WAL mode once after opening the connection.
+	// Exception: On WSL2 with Windows filesystem (/mnt/c/), WAL doesn't work reliably
+	// due to shared-memory limitations across the 9P filesystem boundary (GH#920).
 	if !isInMemory {
-		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-			return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
+		journalMode := "WAL"
+		if isWSL2WindowsPath(path) {
+			journalMode = "DELETE" // Fallback for WSL2 Windows filesystem
+		}
+		if _, err := db.Exec("PRAGMA journal_mode=" + journalMode); err != nil {
+			return nil, fmt.Errorf("failed to enable %s mode: %w", journalMode, err)
 		}
 	}
 
@@ -203,16 +232,88 @@ func NewWithTimeout(ctx context.Context, path string, busyTimeout time.Duration)
 	return storage, nil
 }
 
+// NewReadOnly opens an existing database in read-only mode.
+// This prevents any modification to the database file, including:
+// - WAL journal mode changes
+// - Schema/migration updates
+// - WAL checkpointing on close
+//
+// Use this for read-only commands (list, ready, show, stats, etc.) to avoid
+// triggering file watchers. See GH#804.
+//
+// Returns an error if the database doesn't exist (unlike New which creates it).
+func NewReadOnly(ctx context.Context, path string) (*SQLiteStorage, error) {
+	return NewReadOnlyWithTimeout(ctx, path, 30*time.Second)
+}
+
+// NewReadOnlyWithTimeout opens an existing database in read-only mode with configurable timeout.
+func NewReadOnlyWithTimeout(ctx context.Context, path string, busyTimeout time.Duration) (*SQLiteStorage, error) {
+	// Read-only mode doesn't make sense for in-memory databases
+	if path == ":memory:" || (strings.HasPrefix(path, "file:") && strings.Contains(path, "mode=memory")) {
+		return nil, fmt.Errorf("read-only mode not supported for in-memory databases")
+	}
+
+	// Check that the database file exists
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, fmt.Errorf("database does not exist: %s", path)
+	}
+
+	// Convert timeout to milliseconds for SQLite pragma
+	timeoutMs := int64(busyTimeout / time.Millisecond)
+
+	// Build read-only connection string with mode=ro
+	// This prevents any writes to the database file
+	connStr := fmt.Sprintf("file:%s?mode=ro&_pragma=foreign_keys(ON)&_pragma=busy_timeout(%d)&_time_format=sqlite", path, timeoutMs)
+
+	db, err := sql.Open("sqlite3", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database read-only: %w", err)
+	}
+
+	// Read-only connections don't need a large pool
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Skip schema initialization and migrations - we're read-only
+	// The database must already be properly initialized
+
+	// Convert to absolute path for consistency
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	return &SQLiteStorage{
+		db:          db,
+		dbPath:      absPath,
+		connStr:     connStr,
+		busyTimeout: busyTimeout,
+		readOnly:    true,
+	}, nil
+}
+
 // Close closes the database connection.
-// It checkpoints the WAL to ensure all writes are flushed to the main database file.
+// For read-write connections, it checkpoints the WAL to ensure all writes
+// are flushed to the main database file.
+// For read-only connections (GH#804), it skips checkpointing to avoid file modifications.
 func (s *SQLiteStorage) Close() error {
 	s.closed.Store(true)
 	// Acquire write lock to prevent racing with reconnect() (GH#607)
 	s.reconnectMu.Lock()
 	defer s.reconnectMu.Unlock()
-	// Checkpoint WAL to ensure all writes are persisted to the main database file.
-	// Without this, writes may be stranded in the WAL and lost between CLI invocations.
-	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	// Only checkpoint for read-write connections (GH#804)
+	// Read-only connections should not modify the database file at all.
+	if !s.readOnly {
+		// Checkpoint WAL to ensure all writes are persisted to the main database file.
+		// Without this, writes may be stranded in the WAL and lost between CLI invocations.
+		_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	}
 	return s.db.Close()
 }
 
@@ -403,13 +504,17 @@ func (s *SQLiteStorage) reconnect() error {
 	// Restore connection pool settings
 	s.configureConnectionPool(db)
 
-	// Re-enable WAL mode for file-based databases
+	// Re-enable WAL mode for file-based databases (or DELETE for WSL2 Windows paths)
 	isInMemory := s.dbPath == ":memory:" ||
 		(strings.HasPrefix(s.connStr, "file:") && strings.Contains(s.connStr, "mode=memory"))
 	if !isInMemory {
-		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		journalMode := "WAL"
+		if isWSL2WindowsPath(s.dbPath) {
+			journalMode = "DELETE" // Fallback for WSL2 Windows filesystem (GH#920)
+		}
+		if _, err := db.Exec("PRAGMA journal_mode=" + journalMode); err != nil {
 			_ = db.Close()
-			return fmt.Errorf("failed to enable WAL mode on reconnect: %w", err)
+			return fmt.Errorf("failed to enable %s mode on reconnect: %w", journalMode, err)
 		}
 	}
 
