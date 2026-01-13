@@ -36,18 +36,38 @@ Tool-level settings you can configure:
 | `no-auto-import` | `--no-auto-import` | `BD_NO_AUTO_IMPORT` | `false` | Disable auto JSONL import |
 | `no-push` | `--no-push` | `BD_NO_PUSH` | `false` | Skip pushing to remote in bd sync |
 | `create.require-description` | - | `BD_CREATE_REQUIRE_DESCRIPTION` | `false` | Require description when creating issues |
+| `validation.on-create` | - | `BD_VALIDATION_ON_CREATE` | `none` | Template validation on create: `none`, `warn`, `error` |
+| `validation.on-sync` | - | `BD_VALIDATION_ON_SYNC` | `none` | Template validation before sync: `none`, `warn`, `error` |
 | `git.author` | - | `BD_GIT_AUTHOR` | (none) | Override commit author for beads commits |
 | `git.no-gpg-sign` | - | `BD_GIT_NO_GPG_SIGN` | `false` | Disable GPG signing for beads commits |
 | `directory.labels` | - | - | (none) | Map directories to labels for automatic filtering |
 | `external_projects` | - | - | (none) | Map project names to paths for cross-project deps |
 | `db` | `--db` | `BD_DB` | (auto-discover) | Database path |
-| `actor` | `--actor` | `BD_ACTOR` | `$USER` | Actor name for audit trail |
+| `actor` | `--actor` | `BD_ACTOR` | `git config user.name` | Actor name for audit trail (see below) |
 | `flush-debounce` | - | `BEADS_FLUSH_DEBOUNCE` | `5s` | Debounce time for auto-flush |
 | `auto-start-daemon` | - | `BEADS_AUTO_START_DAEMON` | `true` | Auto-start daemon if not running |
 | `daemon-log-max-size` | - | `BEADS_DAEMON_LOG_MAX_SIZE` | `50` | Max daemon log size in MB before rotation |
 | `daemon-log-max-backups` | - | `BEADS_DAEMON_LOG_MAX_BACKUPS` | `7` | Max number of old log files to keep |
 | `daemon-log-max-age` | - | `BEADS_DAEMON_LOG_MAX_AGE` | `30` | Max days to keep old log files |
 | `daemon-log-compress` | - | `BEADS_DAEMON_LOG_COMPRESS` | `true` | Compress rotated log files |
+
+### Actor Identity Resolution
+
+The actor name (used for `created_by` in issues and audit trails) is resolved in this order:
+
+1. `--actor` flag (explicit override)
+2. `BD_ACTOR` environment variable
+3. `BEADS_ACTOR` environment variable (alias for MCP/integration compatibility)
+4. `git config user.name`
+5. `$USER` environment variable (system username fallback)
+6. `"unknown"` (final fallback)
+
+For most developers, no configuration is needed - beads will use your git identity automatically. This ensures your issue authorship matches your commit authorship.
+
+To override, set `BD_ACTOR` in your shell profile:
+```bash
+export BD_ACTOR="my-github-handle"
+```
 
 ### Example Config File
 
@@ -80,6 +100,13 @@ flush-debounce: 15s
 # Require descriptions on all issues (enforces context for future work)
 create:
   require-description: true
+
+# Template validation settings (bd-t7jq)
+# Validates that issues include required sections based on issue type
+# Values: none (default), warn (print warning), error (block operation)
+validation:
+  on-create: warn   # Warn when creating issues missing sections
+  on-sync: none     # No validation on sync (backwards compatible)
 
 # Git commit signing options (GH#600)
 # Useful when you have Touch ID commit signing that prompts for each commit

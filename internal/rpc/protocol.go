@@ -82,6 +82,7 @@ type CreateArgs struct {
 	Priority           int      `json:"priority"`
 	Design             string   `json:"design,omitempty"`
 	AcceptanceCriteria string   `json:"acceptance_criteria,omitempty"`
+	Notes              string   `json:"notes,omitempty"`
 	Assignee           string   `json:"assignee,omitempty"`
 	ExternalRef        string   `json:"external_ref,omitempty"`  // Link to external issue trackers
 	EstimatedMinutes   *int     `json:"estimated_minutes,omitempty"` // Time estimate in minutes
@@ -97,6 +98,7 @@ type CreateArgs struct {
 	// ID generation
 	IDPrefix  string `json:"id_prefix,omitempty"`  // Override prefix for ID generation (mol, eph, etc.)
 	CreatedBy string `json:"created_by,omitempty"` // Who created the issue
+	Owner     string `json:"owner,omitempty"`      // Human owner for CV attribution (git author email)
 	// Molecule type (for swarm coordination)
 	MolType string `json:"mol_type,omitempty"` // swarm, patrol, or work (default)
 	// Agent identity fields (only valid when IssueType == "agent")
@@ -107,6 +109,9 @@ type CreateArgs struct {
 	EventActor    string `json:"event_actor,omitempty"`    // Entity URI who caused this event
 	EventTarget   string `json:"event_target,omitempty"`   // Entity URI or bead ID affected
 	EventPayload  string `json:"event_payload,omitempty"`  // Event-specific JSON data
+	// Time-based scheduling fields (GH#820)
+	DueAt      string `json:"due_at,omitempty"`      // Relative or ISO format due date
+	DeferUntil string `json:"defer_until,omitempty"` // Relative or ISO format defer date
 }
 
 // UpdateArgs represents arguments for the update operation
@@ -152,13 +157,25 @@ type UpdateArgs struct {
 	EventActor    *string `json:"event_actor,omitempty"`    // Entity URI who caused this event
 	EventTarget   *string `json:"event_target,omitempty"`   // Entity URI or bead ID affected
 	EventPayload  *string `json:"event_payload,omitempty"`  // Event-specific JSON data
+	// Work queue claim operation
+	Claim bool `json:"claim,omitempty"` // If true, atomically claim issue (set assignee+status, fail if already claimed)
+	// Time-based scheduling fields (GH#820)
+	DueAt      *string `json:"due_at,omitempty"`      // Relative or ISO format due date
+	DeferUntil *string `json:"defer_until,omitempty"` // Relative or ISO format defer date
+	// Gate fields
+	AwaitID *string  `json:"await_id,omitempty"` // Condition identifier for gates (run ID, PR number, etc.)
+	Waiters []string `json:"waiters,omitempty"`  // Mail addresses to notify when gate clears
+	// Slot fields
+	Holder *string `json:"holder,omitempty"` // Who currently holds the slot (for type=slot beads)
 }
 
 // CloseArgs represents arguments for the close operation
 type CloseArgs struct {
 	ID          string `json:"id"`
 	Reason      string `json:"reason,omitempty"`
+	Session     string `json:"session,omitempty"`      // Claude Code session ID that closed this issue
 	SuggestNext bool   `json:"suggest_next,omitempty"` // Return newly unblocked issues (GH#679)
+	Force       bool   `json:"force,omitempty"`        // Force close even with open blockers (GH#962)
 }
 
 // CloseResult is returned when SuggestNext is true (GH#679)
@@ -229,6 +246,20 @@ type ListArgs struct {
 
 	// Status exclusion (for default non-closed behavior, GH#788)
 	ExcludeStatus []string `json:"exclude_status,omitempty"`
+
+	// Type exclusion (for hiding internal types like gates, bd-7zka.2)
+	ExcludeTypes []string `json:"exclude_types,omitempty"`
+
+	// Time-based scheduling filters (GH#820)
+	Deferred    bool   `json:"deferred,omitempty"`     // Filter issues with defer_until set
+	DeferAfter  string `json:"defer_after,omitempty"`  // ISO 8601 format
+	DeferBefore string `json:"defer_before,omitempty"` // ISO 8601 format
+	DueAfter    string `json:"due_after,omitempty"`    // ISO 8601 format
+	DueBefore   string `json:"due_before,omitempty"`   // ISO 8601 format
+	Overdue     bool   `json:"overdue,omitempty"`      // Filter issues where due_at < now
+
+	// Staleness control (bd-dpkdm)
+	AllowStale bool `json:"allow_stale,omitempty"` // Skip staleness check, return potentially stale data
 }
 
 // CountArgs represents arguments for the count operation
@@ -289,8 +320,9 @@ type ReadyArgs struct {
 	SortPolicy string   `json:"sort_policy,omitempty"`
 	Labels     []string `json:"labels,omitempty"`
 	LabelsAny  []string `json:"labels_any,omitempty"`
-	ParentID   string   `json:"parent_id,omitempty"` // Filter to descendants of this bead/epic
-	MolType    string   `json:"mol_type,omitempty"`  // Filter by molecule type: swarm, patrol, or work
+	ParentID        string   `json:"parent_id,omitempty"`        // Filter to descendants of this bead/epic
+	MolType         string   `json:"mol_type,omitempty"`         // Filter by molecule type: swarm, patrol, or work
+	IncludeDeferred bool     `json:"include_deferred,omitempty"` // Include issues with future defer_until (GH#820)
 }
 
 // BlockedArgs represents arguments for the blocked operation

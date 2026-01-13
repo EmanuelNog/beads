@@ -1,12 +1,17 @@
 package doctor
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/steveyegge/beads/internal/daemon"
+	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/syncbranch"
 )
 
 // CheckDaemonStatus checks the health of the daemon for a workspace.
@@ -121,4 +126,166 @@ func CheckVersionMismatch(db *sql.DB, cliVersion string) string {
 	}
 
 	return ""
+}
+
+// CheckGitSyncSetup checks if git repository and sync-branch are configured for daemon sync.
+// This is informational - beads works fine without git sync, but users may want to enable it.
+func CheckGitSyncSetup(path string) DoctorCheck {
+	// Check if we're in a git repository
+	_, err := git.GetGitDir()
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Git Sync Setup",
+			Status:   StatusWarning,
+			Message:  "No git repository (background sync unavailable)",
+			Detail:   "The daemon requires a git repository for background sync. Without it, beads runs in direct mode.",
+			Fix:      "Run 'git init' to enable background sync",
+			Category: CategoryRuntime,
+		}
+	}
+
+	// Git repo exists - check if sync-branch is configured
+	if !syncbranch.IsConfigured() {
+		return DoctorCheck{
+			Name:     "Git Sync Setup",
+			Status:   StatusOK,
+			Message:  "Git repository detected (sync-branch not configured)",
+			Detail:   "Beads commits directly to current branch. For team collaboration or to keep beads changes isolated, consider using a sync-branch.",
+			Fix:      "Run 'bd config set sync.branch beads-sync' to use a dedicated branch for beads metadata",
+			Category: CategoryRuntime,
+		}
+	}
+
+	return DoctorCheck{
+		Name:     "Git Sync Setup",
+		Status:   StatusOK,
+		Message:  "Git repository and sync-branch configured",
+		Category: CategoryRuntime,
+	}
+}
+
+// CheckDaemonAutoSync checks if daemon has auto-commit/auto-push enabled when
+// sync-branch is configured. Missing auto-sync slows down agent workflows.
+func CheckDaemonAutoSync(path string) DoctorCheck {
+	beadsDir := filepath.Join(path, ".beads")
+	socketPath := filepath.Join(beadsDir, "bd.sock")
+
+	// Check if daemon is running
+	if _, err := os.Stat(socketPath); os.IsNotExist(err) {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusOK,
+			Message: "Daemon not running (will use defaults on next start)",
+		}
+	}
+
+	// Check if sync-branch is configured
+	ctx := context.Background()
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	store, err := sqlite.New(ctx, dbPath)
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusOK,
+			Message: "Could not check config (database unavailable)",
+		}
+	}
+	defer func() { _ = store.Close() }()
+
+	syncBranch, _ := store.GetConfig(ctx, "sync.branch")
+	if syncBranch == "" {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusOK,
+			Message: "No sync-branch configured (auto-sync not applicable)",
+		}
+	}
+
+	// Sync-branch is configured - check daemon's auto-commit/auto-push status
+	client, err := rpc.TryConnect(socketPath)
+	if err != nil || client == nil {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusWarning,
+			Message: "Could not connect to daemon to check auto-sync status",
+		}
+	}
+	defer func() { _ = client.Close() }()
+
+	status, err := client.Status()
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusWarning,
+			Message: "Could not get daemon status",
+			Detail:  err.Error(),
+		}
+	}
+
+	if !status.AutoCommit || !status.AutoPush {
+		var missing []string
+		if !status.AutoCommit {
+			missing = append(missing, "auto-commit")
+		}
+		if !status.AutoPush {
+			missing = append(missing, "auto-push")
+		}
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Daemon running without %v (slows agent workflows)", missing),
+			Detail:  "With sync-branch configured, auto-commit and auto-push should be enabled",
+			Fix:     "Restart daemon: bd daemon --stop && bd daemon --start",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Daemon Auto-Sync",
+		Status:  StatusOK,
+		Message: "Auto-commit and auto-push enabled",
+	}
+}
+
+// CheckLegacyDaemonConfig checks for deprecated daemon config options and
+// encourages migration to the unified daemon.auto-sync setting.
+func CheckLegacyDaemonConfig(path string) DoctorCheck {
+	beadsDir := filepath.Join(path, ".beads")
+	dbPath := filepath.Join(beadsDir, "beads.db")
+
+	ctx := context.Background()
+	store, err := sqlite.New(ctx, dbPath)
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Daemon Config",
+			Status:  StatusOK,
+			Message: "Could not check config (database unavailable)",
+		}
+	}
+	defer func() { _ = store.Close() }()
+
+	// Check for deprecated individual settings
+	var legacySettings []string
+
+	if val, _ := store.GetConfig(ctx, "daemon.auto_commit"); val != "" {
+		legacySettings = append(legacySettings, "daemon.auto_commit")
+	}
+	if val, _ := store.GetConfig(ctx, "daemon.auto_push"); val != "" {
+		legacySettings = append(legacySettings, "daemon.auto_push")
+	}
+
+	if len(legacySettings) > 0 {
+		return DoctorCheck{
+			Name:    "Daemon Config",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Deprecated config options found: %v", legacySettings),
+			Detail:  "These options still work but are deprecated. Use daemon.auto-sync for read/write mode or daemon.auto-pull for read-only mode.",
+			Fix:     "Run: bd config delete daemon.auto_commit && bd config delete daemon.auto_push && bd config set daemon.auto-sync true",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Daemon Config",
+		Status:  StatusOK,
+		Message: "Using current config format",
+	}
 }

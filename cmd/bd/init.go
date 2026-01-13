@@ -147,19 +147,30 @@ With --stealth: configures per-repository git settings for invisible beads usage
 		if isGitRepo() {
 			isWorktree = git.IsWorktree()
 		}
-		var beadsDir string
+
+		// Prevent initialization from within a worktree
 		if isWorktree {
-			// For worktrees, .beads should be in the main repository root
 			mainRepoRoot, err := git.GetMainRepoRoot()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to get main repository root: %v\n", err)
 				os.Exit(1)
 			}
-			beadsDir = filepath.Join(mainRepoRoot, ".beads")
-		} else {
-			// For regular repos, use current directory
-			beadsDir = filepath.Join(cwd, ".beads")
+
+			fmt.Fprintf(os.Stderr, "Error: cannot run 'bd init' from within a git worktree\n\n")
+			fmt.Fprintf(os.Stderr, "Git worktrees share the .beads database from the main repository.\n")
+			fmt.Fprintf(os.Stderr, "To fix this:\n\n")
+			fmt.Fprintf(os.Stderr, "  1. Initialize beads in the main repository:\n")
+			fmt.Fprintf(os.Stderr, "     cd %s\n", mainRepoRoot)
+			fmt.Fprintf(os.Stderr, "     bd init\n\n")
+			fmt.Fprintf(os.Stderr, "  2. Then create worktrees with beads support:\n")
+			fmt.Fprintf(os.Stderr, "     bd worktree create <path> --branch <branch-name>\n\n")
+			fmt.Fprintf(os.Stderr, "For more information, see: https://github.com/steveyegge/beads/blob/main/docs/WORKTREES.md\n")
+			os.Exit(1)
 		}
+
+		var beadsDir string
+		// For regular repos, use current directory
+		beadsDir = filepath.Join(cwd, ".beads")
 
 		// Prevent nested .beads directories
 		// Check if current working directory is inside a .beads directory
@@ -287,24 +298,6 @@ With --stealth: configures per-repository git settings for invisible beads usage
 			os.Exit(1)
 		}
 
-		// Set sync.branch only if explicitly specified via --branch flag
-		// GH#807: Do NOT auto-detect current branch - if sync.branch is set to main/master,
-		// the worktree created by bd sync will check out main, preventing the user from
-		// checking out main in their working directory (git error: "'main' is already checked out")
-		//
-		// When --branch is not specified, bd sync will commit directly to the current branch
-		// (the original behavior before sync branch feature)
-		if branch != "" {
-			if err := syncbranch.Set(ctx, store, branch); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to set sync branch: %v\n", err)
-				_ = store.Close()
-				os.Exit(1)
-			}
-			if !quiet {
-				fmt.Printf("  Sync branch: %s\n", branch)
-			}
-		}
-
 		// === TRACKING METADATA (Pattern B: Warn and Continue) ===
 		// Tracking metadata enhances functionality (diagnostics, version checks, collision detection)
 		// but the system works without it. Failures here degrade gracefully - we warn but continue.
@@ -383,6 +376,27 @@ With --stealth: configures per-repository git settings for invisible beads usage
 			if err := createReadme(beadsDir); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create README.md: %v\n", err)
 				// Non-fatal - continue anyway
+			}
+		}
+
+		// Set sync.branch only if explicitly specified via --branch flag
+		// GH#807: Do NOT auto-detect current branch - if sync.branch is set to main/master,
+		// the worktree created by bd sync will check out main, preventing the user from
+		// checking out main in their working directory (git error: "'main' is already checked out")
+		//
+		// When --branch is not specified, bd sync will commit directly to the current branch
+		// (the original behavior before sync branch feature)
+		//
+		// GH#927: This must run AFTER createConfigYaml() so that config.yaml exists
+		// and syncbranch.Set() can update it via config.SetYamlConfig() (PR#910 mechanism)
+		if branch != "" {
+			if err := syncbranch.Set(ctx, store, branch); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to set sync branch: %v\n", err)
+				_ = store.Close()
+				os.Exit(1)
+			}
+			if !quiet {
+				fmt.Printf("  Sync branch: %s\n", branch)
 			}
 		}
 

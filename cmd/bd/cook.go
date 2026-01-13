@@ -151,14 +151,20 @@ func parseCookFlags(cmd *cobra.Command, args []string) (*cookFlags, error) {
 	}, nil
 }
 
-// loadAndResolveFormula parses a formula file and applies all transformations
+// loadAndResolveFormula parses a formula file and applies all transformations.
+// It first tries to load by name from the formula registry (.beads/formulas/),
+// and falls back to parsing as a file path if that fails.
 func loadAndResolveFormula(formulaPath string, searchPaths []string) (*formula.Formula, error) {
 	parser := formula.NewParser(searchPaths...)
 
-	// Parse the formula file
-	f, err := parser.ParseFile(formulaPath)
+	// Try to load by name first (from .beads/formulas/ registry)
+	f, err := parser.LoadByName(formulaPath)
 	if err != nil {
-		return nil, fmt.Errorf("parsing formula: %w", err)
+		// Fall back to parsing as a file path
+		f, err = parser.ParseFile(formulaPath)
+		if err != nil {
+			return nil, fmt.Errorf("parsing formula: %w", err)
+		}
 	}
 
 	// Resolve inheritance
@@ -437,11 +443,25 @@ func cookFormulaToSubgraph(f *formula.Formula, protoID string) (*TemplateSubgrap
 	var issues []*types.Issue
 	var deps []*types.Dependency
 
+	// Determine root title: use {{title}} placeholder if the variable is defined,
+	// otherwise fall back to formula name (GH#852)
+	rootTitle := f.Formula
+	if _, hasTitle := f.Vars["title"]; hasTitle {
+		rootTitle = "{{title}}"
+	}
+
+	// Determine root description: use {{desc}} placeholder if the variable is defined,
+	// otherwise fall back to formula description (GH#852)
+	rootDesc := f.Description
+	if _, hasDesc := f.Vars["desc"]; hasDesc {
+		rootDesc = "{{desc}}"
+	}
+
 	// Create root proto epic
 	rootIssue := &types.Issue{
 		ID:          protoID,
-		Title:       f.Formula, // Title is the original formula name
-		Description: f.Description,
+		Title:       rootTitle,
+		Description: rootDesc,
 		Status:      types.StatusOpen,
 		Priority:    2,
 		IssueType:   types.TypeEpic,
@@ -468,6 +488,47 @@ func cookFormulaToSubgraph(f *formula.Formula, protoID string) (*TemplateSubgrap
 		Dependencies: deps,
 		IssueMap:     issueMap,
 	}, nil
+}
+
+// createGateIssue creates a gate issue for a step with a Gate field.
+// Gate issues have type=gate and block the step they guard.
+// Returns the gate issue and its ID.
+func createGateIssue(step *formula.Step, parentID string) *types.Issue {
+	if step.Gate == nil {
+		return nil
+	}
+
+	// Generate gate issue ID: {parentID}.gate-{step.ID}
+	gateID := fmt.Sprintf("%s.gate-%s", parentID, step.ID)
+
+	// Build title from gate type and ID
+	title := fmt.Sprintf("Gate: %s", step.Gate.Type)
+	if step.Gate.ID != "" {
+		title = fmt.Sprintf("Gate: %s %s", step.Gate.Type, step.Gate.ID)
+	}
+
+	// Parse timeout if specified
+	var timeout time.Duration
+	if step.Gate.Timeout != "" {
+		if parsed, err := time.ParseDuration(step.Gate.Timeout); err == nil {
+			timeout = parsed
+		}
+	}
+
+	return &types.Issue{
+		ID:          gateID,
+		Title:       title,
+		Description: fmt.Sprintf("Async gate for step %s", step.ID),
+		Status:      types.StatusOpen,
+		Priority:    2,
+		IssueType:   types.TypeGate,
+		AwaitType:   step.Gate.Type,
+		AwaitID:     step.Gate.ID,
+		Timeout:     timeout,
+		IsTemplate:  true,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
 }
 
 // processStepToIssue converts a formula.Step to a types.Issue.
@@ -556,6 +617,41 @@ func collectSteps(steps []*formula.Step, parentID string,
 			Type:        types.DepParentChild,
 		})
 
+		// Create gate issue if step has a Gate (bd-7zka.2)
+		if step.Gate != nil {
+			gateIssue := createGateIssue(step, parentID)
+			*issues = append(*issues, gateIssue)
+
+			// Add gate to mapping (use gate-{step.ID} as key)
+			gateKey := fmt.Sprintf("gate-%s", step.ID)
+			idMapping[gateKey] = gateIssue.ID
+			if issueMap != nil {
+				issueMap[gateIssue.ID] = gateIssue
+			}
+
+			// Handle gate labels if needed
+			if labelHandler != nil && len(gateIssue.Labels) > 0 {
+				for _, label := range gateIssue.Labels {
+					labelHandler(gateIssue.ID, label)
+				}
+				gateIssue.Labels = nil
+			}
+
+			// Gate is a child of the parent (same level as the step)
+			*deps = append(*deps, &types.Dependency{
+				IssueID:     gateIssue.ID,
+				DependsOnID: parentID,
+				Type:        types.DepParentChild,
+			})
+
+			// Step depends on gate (gate blocks the step)
+			*deps = append(*deps, &types.Dependency{
+				IssueID:     issue.ID,
+				DependsOnID: gateIssue.ID,
+				Type:        types.DepBlocks,
+			})
+		}
+
 		// Recursively collect children
 		if len(step.Children) > 0 {
 			collectSteps(step.Children, issue.ID, idMapping, issueMap, issues, deps, labelHandler)
@@ -568,6 +664,13 @@ func collectSteps(steps []*formula.Step, parentID string,
 // and returns an in-memory TemplateSubgraph ready for instantiation.
 // This is the main entry point for ephemeral proto cooking.
 func resolveAndCookFormula(formulaName string, searchPaths []string) (*TemplateSubgraph, error) {
+	return resolveAndCookFormulaWithVars(formulaName, searchPaths, nil)
+}
+
+// resolveAndCookFormulaWithVars loads a formula and optionally filters steps by condition.
+// If conditionVars is provided, steps with conditions that evaluate to false are excluded.
+// Pass nil for conditionVars to include all steps (condition filtering skipped).
+func resolveAndCookFormulaWithVars(formulaName string, searchPaths []string, conditionVars map[string]string) (*TemplateSubgraph, error) {
 	// Create parser with search paths
 	parser := formula.NewParser(searchPaths...)
 
@@ -627,6 +730,27 @@ func resolveAndCookFormula(formulaName string, searchPaths []string) (*TemplateS
 		}
 	}
 
+	// Apply step condition filtering if vars provided (bd-7zka.1)
+	// This filters out steps whose conditions evaluate to false
+	if conditionVars != nil {
+		// Merge with formula defaults for complete evaluation
+		mergedVars := make(map[string]string)
+		for name, def := range resolved.Vars {
+			if def != nil && def.Default != "" {
+				mergedVars[name] = def.Default
+			}
+		}
+		for k, v := range conditionVars {
+			mergedVars[k] = v
+		}
+
+		filteredSteps, err := formula.FilterStepsByCondition(resolved.Steps, mergedVars)
+		if err != nil {
+			return nil, fmt.Errorf("filtering steps by condition: %w", err)
+		}
+		resolved.Steps = filteredSteps
+	}
+
 	// Cook to in-memory subgraph, including variable definitions for default handling
 	return cookFormulaToSubgraphWithVars(resolved, resolved.Formula, resolved.Vars)
 }
@@ -673,11 +797,25 @@ func cookFormula(ctx context.Context, s storage.Storage, f *formula.Formula, pro
 	var deps []*types.Dependency
 	var labels []struct{ issueID, label string }
 
+	// Determine root title: use {{title}} placeholder if the variable is defined,
+	// otherwise fall back to formula name (GH#852)
+	rootTitle := f.Formula
+	if _, hasTitle := f.Vars["title"]; hasTitle {
+		rootTitle = "{{title}}"
+	}
+
+	// Determine root description: use {{desc}} placeholder if the variable is defined,
+	// otherwise fall back to formula description (GH#852)
+	rootDesc := f.Description
+	if _, hasDesc := f.Vars["desc"]; hasDesc {
+		rootDesc = "{{desc}}"
+	}
+
 	// Create root proto epic using provided protoID (may include prefix)
 	rootIssue := &types.Issue{
 		ID:          protoID,
-		Title:       f.Formula, // Title is the original formula name
-		Description: f.Description,
+		Title:       rootTitle,
+		Description: rootDesc,
 		Status:      types.StatusOpen,
 		Priority:    2,
 		IssueType:   types.TypeEpic,

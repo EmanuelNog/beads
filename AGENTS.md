@@ -1,8 +1,24 @@
 # Agent Instructions
 
-See [CLAUDE.md](CLAUDE.md) for full instructions.
+See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full instructions.
 
 This file exists for compatibility with tools that look for AGENTS.md.
+
+## Key Sections in CLAUDE.md
+
+- **Issue Tracking** - How to use bd for work management
+- **Development Guidelines** - Code standards and testing
+- **Visual Design System** - Status icons, colors, and semantic styling for CLI output
+
+## Visual Design Anti-Patterns
+
+**NEVER use emoji-style icons** (🔴🟠🟡🔵⚪) in CLI output. They cause cognitive overload.
+
+**ALWAYS use small Unicode symbols** with semantic colors:
+- Status: `○ ◐ ● ✓ ❄`
+- Priority: `● P0` (filled circle with color)
+
+See CLAUDE.md "Visual Design System" section for full guidance.
 
 ## Landing the Plane (Session Completion)
 

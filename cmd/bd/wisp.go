@@ -167,7 +167,8 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 
 	// Try to cook formula inline (ephemeral protos)
 	// This works for any valid formula name, not just "mol-" prefixed ones
-	sg, err := resolveAndCookFormula(args[0], nil)
+	// Pass vars for step condition filtering (bd-7zka.1)
+	sg, err := resolveAndCookFormulaWithVars(args[0], nil, vars)
 	if err == nil {
 		subgraph = sg
 		protoID = sg.Root.ID
@@ -210,9 +211,14 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 		}
 
 		// Load the proto
+		// Note: GetIssue returns (nil, nil) for not-found, so check both
 		protoIssue, err := store.GetIssue(ctx, protoID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading proto %s: %v\n", protoID, err)
+			os.Exit(1)
+		}
+		if protoIssue == nil {
+			fmt.Fprintf(os.Stderr, "Error: proto not found: %s\n", protoID)
 			os.Exit(1)
 		}
 		if !isProtoIssue(protoIssue) {
@@ -256,8 +262,8 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 	}
 
 	// Spawn as ephemeral in main database (Ephemeral=true, skips JSONL export)
-	// Use "eph" prefix for distinct visual recognition
-	result, err := spawnMolecule(ctx, store, subgraph, vars, "", actor, true, "eph")
+	// Use "wisp" prefix for distinct visual recognition
+	result, err := spawnMolecule(ctx, store, subgraph, vars, "", actor, true, "wisp")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating wisp: %v\n", err)
 		os.Exit(1)
@@ -296,7 +302,8 @@ func isProtoIssue(issue *types.Issue) bool {
 // resolvePartialIDDirect resolves a partial ID directly from store
 func resolvePartialIDDirect(ctx context.Context, partial string) (string, error) {
 	// Try direct lookup first
-	if issue, err := store.GetIssue(ctx, partial); err == nil {
+	// Note: GetIssue returns (nil, nil) for not-found, so check both
+	if issue, err := store.GetIssue(ctx, partial); err == nil && issue != nil {
 		return issue.ID, nil
 	}
 	// Search by prefix

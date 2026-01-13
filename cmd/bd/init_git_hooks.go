@@ -5,12 +5,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/ui"
 )
+
+// preCommitFrameworkPattern matches pre-commit or prek framework hooks.
+// Uses same patterns as hookManagerPatterns in doctor/fix/hooks.go for consistency.
+// Includes all detection patterns: pre-commit run, prek run/hook-impl, config file refs, and pre-commit env vars.
+var preCommitFrameworkPattern = regexp.MustCompile(`(?i)(pre-commit\s+run|prek\s+run|prek\s+hook-impl|\.pre-commit-config|INSTALL_PYTHON|PRE_COMMIT)`)
 
 // hooksInstalled checks if bd git hooks are installed
 func hooksInstalled() bool {
@@ -64,12 +70,12 @@ func hooksInstalled() bool {
 
 // hookInfo contains information about an existing hook
 type hookInfo struct {
-	name        string
-	path        string
-	exists      bool
-	isBdHook    bool
-	isPreCommit bool
-	content     string
+	name                 string
+	path                 string
+	exists               bool
+	isBdHook             bool
+	isPreCommitFramework bool // true for pre-commit or prek
+	content              string
 }
 
 // detectExistingHooks scans for existing git hooks
@@ -91,10 +97,10 @@ func detectExistingHooks() []hookInfo {
 			hooks[i].exists = true
 			hooks[i].content = string(content)
 			hooks[i].isBdHook = strings.Contains(hooks[i].content, "bd (beads)")
-			// Only detect pre-commit framework if not a bd hook
+			// Only detect pre-commit/prek framework if not a bd hook
+			// Use regex for consistency with DetectActiveHookManager patterns
 			if !hooks[i].isBdHook {
-				hooks[i].isPreCommit = strings.Contains(hooks[i].content, "pre-commit run") ||
-					strings.Contains(hooks[i].content, ".pre-commit-config")
+				hooks[i].isPreCommitFramework = preCommitFrameworkPattern.MatchString(hooks[i].content)
 			}
 		}
 	}
@@ -108,8 +114,8 @@ func promptHookAction(existingHooks []hookInfo) string {
 	for _, hook := range existingHooks {
 		if hook.exists && !hook.isBdHook {
 			hookType := "custom script"
-			if hook.isPreCommit {
-				hookType = "pre-commit framework"
+			if hook.isPreCommitFramework {
+				hookType = "pre-commit/prek framework"
 			}
 			fmt.Printf("  - %s (%s)\n", hook.name, hookType)
 		}
@@ -160,6 +166,16 @@ func installGitHooks() error {
 		switch choice {
 		case "1", "":
 			chainHooks = true
+			// Chain mode - rename existing hooks to .old so they can be called
+			for _, hook := range existingHooks {
+				if hook.exists && !hook.isBdHook {
+					oldPath := hook.path + ".old"
+					if err := os.Rename(hook.path, oldPath); err != nil {
+						return fmt.Errorf("failed to rename %s to .old: %w", hook.name, err)
+					}
+					fmt.Printf("  Renamed %s to %s\n", hook.name, filepath.Base(oldPath))
+				}
+			}
 		case "2":
 			// Overwrite mode - backup existing hooks
 			for _, hook := range existingHooks {
@@ -211,12 +227,11 @@ func installGitHooks() error {
 // buildPreCommitHook generates the pre-commit hook content
 func buildPreCommitHook(chainHooks bool, existingHooks []hookInfo) string {
 	if chainHooks {
-		// Find existing pre-commit hook
+		// Find existing pre-commit hook (already renamed to .old by caller)
 		var existingPreCommit string
 		for _, hook := range existingHooks {
 			if hook.name == "pre-commit" && hook.exists && !hook.isBdHook {
 				existingPreCommit = hook.path + ".old"
-				// Note: caller handles the rename
 				break
 			}
 		}
@@ -309,7 +324,7 @@ exit 0
 // buildPostMergeHook generates the post-merge hook content
 func buildPostMergeHook(chainHooks bool, existingHooks []hookInfo) string {
 	if chainHooks {
-		// Find existing post-merge hook
+		// Find existing post-merge hook (already renamed to .old by caller)
 		var existingPostMerge string
 		for _, hook := range existingHooks {
 			if hook.name == "post-merge" && hook.exists && !hook.isBdHook {

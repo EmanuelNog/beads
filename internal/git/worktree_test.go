@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -547,8 +548,9 @@ func TestVerifySparseCheckoutErrors(t *testing.T) {
 		if err == nil {
 			t.Error("verifySparseCheckout should fail with invalid .git file format")
 		}
-		if !strings.Contains(err.Error(), "invalid .git file format") {
-			t.Errorf("Expected 'invalid .git file format' error, got: %v", err)
+		// git sparse-checkout list will fail when .git file is invalid
+		if !strings.Contains(err.Error(), "failed to list sparse checkout patterns") {
+			t.Errorf("Expected 'failed to list sparse checkout patterns' error, got: %v", err)
 		}
 	})
 }
@@ -894,6 +896,54 @@ func TestGetMainRepoRoot(t *testing.T) {
 		}
 	})
 
+	t.Run("returns correct root for submodule repo", func(t *testing.T) {
+		ResetCaches() // Reset caches from previous subtests
+		superRepoPath, superCleanup := setupTestRepo(t)
+		defer superCleanup()
+
+		submoduleRepoPath, submoduleCleanup := setupTestRepo(t)
+		defer submoduleCleanup()
+
+		addCmd := exec.Command("git", "-c", "protocol.file.allow=always", "submodule", "add", submoduleRepoPath, "core")
+		addCmd.Dir = superRepoPath
+		if output, err := addCmd.CombinedOutput(); err != nil {
+			t.Fatalf("Failed to add submodule: %v\nOutput: %s", err, string(output))
+		}
+
+		commitCmd := exec.Command("git", "commit", "-m", "Add submodule")
+		commitCmd.Dir = superRepoPath
+		if output, err := commitCmd.CombinedOutput(); err != nil {
+			t.Fatalf("Failed to commit submodule: %v\nOutput: %s", err, string(output))
+		}
+
+		submodulePath := filepath.Join(superRepoPath, "core")
+
+		// Save current dir and change to submodule
+		originalDir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("Failed to get current dir: %v", err)
+		}
+		defer func() { _ = os.Chdir(originalDir) }()
+
+		if err := os.Chdir(submodulePath); err != nil {
+			t.Fatalf("Failed to chdir to submodule: %v", err)
+		}
+		ResetCaches() // Reset after chdir
+
+		root, err := GetMainRepoRoot()
+		if err != nil {
+			t.Fatalf("GetMainRepoRoot failed: %v", err)
+		}
+
+		// Resolve symlinks for comparison (e.g., /tmp -> /private/tmp on macOS)
+		expectedRoot, _ := filepath.EvalSymlinks(submodulePath)
+		actualRoot, _ := filepath.EvalSymlinks(root)
+
+		if actualRoot != expectedRoot {
+			t.Errorf("GetMainRepoRoot() = %s, want %s (submodule repo)", actualRoot, expectedRoot)
+		}
+	})
+
 	t.Run("returns main repo root from worktree", func(t *testing.T) {
 		ResetCaches() // Reset caches from previous subtests
 		repoPath, cleanup := setupTestRepo(t)
@@ -1128,5 +1178,171 @@ func TestCreateBeadsWorktree_MissingButRegistered(t *testing.T) {
 	valid, err := wm.isValidWorktree(worktreePath)
 	if err != nil || !valid {
 		t.Errorf("Recreated worktree should be valid: valid=%v, err=%v", valid, err)
+	}
+}
+
+// TestCreateBeadsWorktree_MainRepoSparseCheckoutDisabled tests that creating a worktree
+// does not leave core.sparseCheckout enabled on the main repo (GH#886).
+// Git 2.38+ enables sparse checkout on the main repo as a side effect of worktree creation,
+// which causes confusing "You are in a sparse checkout with 100% of tracked files present"
+// message in git status.
+func TestCreateBeadsWorktree_MainRepoSparseCheckoutDisabled(t *testing.T) {
+	repoPath, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	wm := NewWorktreeManager(repoPath)
+	worktreePath := filepath.Join(t.TempDir(), "beads-worktree-gh886")
+
+	// Verify sparse checkout is not enabled before worktree creation
+	cmd := exec.Command("git", "config", "--get", "core.sparseCheckout")
+	cmd.Dir = repoPath
+	output, _ := cmd.Output()
+	initialValue := strings.TrimSpace(string(output))
+	// Empty or "false" are both acceptable initial states
+	if initialValue == "true" {
+		t.Log("Note: sparse checkout was already enabled before test")
+	}
+
+	// Create worktree
+	if err := wm.CreateBeadsWorktree("beads-gh886", worktreePath); err != nil {
+		t.Fatalf("CreateBeadsWorktree failed: %v", err)
+	}
+
+	// Verify sparse checkout is disabled on main repo after worktree creation
+	cmd = exec.Command("git", "config", "--get", "core.sparseCheckout")
+	cmd.Dir = repoPath
+	output, _ = cmd.Output()
+	finalValue := strings.TrimSpace(string(output))
+
+	// Should be either empty (unset) or "false"
+	if finalValue == "true" {
+		t.Errorf("GH#886: Main repo has core.sparseCheckout=true after worktree creation. "+
+			"This causes confusing git status message. Value should be 'false' or unset, got: %q", finalValue)
+	}
+
+	// Verify that sparse checkout functionality STILL WORKS in the worktree
+	// (the patterns were applied during checkout, before we disabled the config)
+	// Check that .beads exists but other.txt does not
+	beadsDir := filepath.Join(worktreePath, ".beads")
+	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+		t.Error(".beads directory should exist in worktree (sparse checkout should include it)")
+	}
+
+	otherFile := filepath.Join(worktreePath, "other.txt")
+	if _, err := os.Stat(otherFile); err == nil {
+		t.Error("other.txt should NOT exist in worktree (sparse checkout should exclude it)")
+	}
+}
+
+// TestGetRepoRootCanonicalCase tests that GetRepoRoot returns paths with correct
+// filesystem case on case-insensitive filesystems (GH#880)
+func TestGetRepoRootCanonicalCase(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("case canonicalization test only runs on macOS")
+	}
+
+	// Create a repo with mixed-case directory
+	tmpDir := t.TempDir()
+	mixedCaseDir := filepath.Join(tmpDir, "TestRepo")
+	if err := os.MkdirAll(mixedCaseDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initialize git repo
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mixedCaseDir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to init git repo: %v\nOutput: %s", err, string(output))
+	}
+
+	// Save cwd and change to the repo using WRONG case
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get current dir: %v", err)
+	}
+	defer func() { _ = os.Chdir(originalDir) }()
+
+	// Access the repo with lowercase (wrong case)
+	wrongCasePath := filepath.Join(tmpDir, "testrepo")
+
+	// Verify the wrong case path works on macOS (case-insensitive)
+	if _, err := os.Stat(wrongCasePath); err != nil {
+		t.Fatalf("Wrong case path should be accessible on macOS: %v", err)
+	}
+
+	if err := os.Chdir(wrongCasePath); err != nil {
+		t.Fatalf("Failed to chdir with wrong case: %v", err)
+	}
+
+	ResetCaches() // Reset git context cache
+
+	// GetRepoRoot should return the canonical case (TestRepo, not testrepo)
+	repoRoot := GetRepoRoot()
+	if repoRoot == "" {
+		t.Fatal("GetRepoRoot returned empty string")
+	}
+
+	// The path should end with "TestRepo" (correct case), not "testrepo"
+	if !strings.HasSuffix(repoRoot, "TestRepo") {
+		t.Errorf("GetRepoRoot() = %q, want path ending in 'TestRepo' (correct case)", repoRoot)
+	}
+}
+
+// TestNormalizeBeadsRelPath tests path normalization for bare repo worktrees (GH#785, GH#810)
+func TestNormalizeBeadsRelPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "already normalized path",
+			input:    ".beads/issues.jsonl",
+			expected: ".beads/issues.jsonl",
+		},
+		{
+			name:     "worktree prefix - main",
+			input:    "main/.beads/issues.jsonl",
+			expected: ".beads/issues.jsonl",
+		},
+		{
+			name:     "worktree prefix - feature branch",
+			input:    "feat-tts-config/.beads/issues.jsonl",
+			expected: ".beads/issues.jsonl",
+		},
+		{
+			name:     "nested worktree prefix",
+			input:    "worktrees/feature/.beads/issues.jsonl",
+			expected: ".beads/issues.jsonl",
+		},
+		{
+			name:     "metadata file",
+			input:    "main/.beads/metadata.json",
+			expected: ".beads/metadata.json",
+		},
+		{
+			name:     "no .beads in path",
+			input:    "some/other/path.jsonl",
+			expected: "some/other/path.jsonl",
+		},
+		{
+			name:     "only .beads dir (no trailing slash - not normalized)",
+			input:    ".beads",
+			expected: ".beads",
+		},
+		{
+			name:     "empty path",
+			input:    "",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := NormalizeBeadsRelPath(tt.input)
+			if result != tt.expected {
+				t.Errorf("NormalizeBeadsRelPath(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
 	}
 }

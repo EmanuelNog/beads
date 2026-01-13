@@ -93,6 +93,16 @@ func TestValidateIDFormat(t *testing.T) {
 		{"bd-a3f8e9.1", "bd", false},
 		{"foo-bar", "foo", false},
 		{"nohyphen", "", true},
+
+		// Hyphenated prefix support
+		// These test cases verify that ValidateIDFormat correctly extracts
+		// prefixes containing hyphens (e.g., "bead-me-up" not just "bead")
+		{"bead-me-up-3e9", "bead-me-up", false},           // 3-char hash suffix
+		{"bead-me-up-3e9.1", "bead-me-up", false},         // hierarchical child
+		{"bead-me-up-3e9.1.2", "bead-me-up", false},       // deeply nested child
+		{"web-app-a3f8e9", "web-app", false},              // 6-char hash suffix
+		{"my-cool-project-1a2b", "my-cool-project", false}, // 4-char hash suffix
+		{"document-intelligence-0sa", "document-intelligence", false}, // 3-char hash
 	}
 
 	for _, tt := range tests {
@@ -104,6 +114,90 @@ func TestValidateIDFormat(t *testing.T) {
 			}
 			if got != tt.wantPrefix {
 				t.Errorf("ValidateIDFormat(%q) = %q, want %q", tt.input, got, tt.wantPrefix)
+			}
+		})
+	}
+}
+
+// TestValidateIDFormat_ParentChildFlow tests the exact scenario that fails with --parent flag:
+// When creating a child of a parent with a hyphenated prefix, the generated child ID
+// (e.g., "bead-me-up-3e9.1") should have its prefix correctly extracted as "bead-me-up",
+// not "bead". This test simulates the create.go flow at lines 352-391.
+func TestValidateIDFormat_ParentChildFlow(t *testing.T) {
+	tests := []struct {
+		name         string
+		parentID     string
+		childSuffix  string
+		dbPrefix     string
+		wantPrefix   string
+		shouldMatch  bool
+	}{
+		{
+			name:        "simple prefix - child creation works",
+			parentID:    "bd-a3f8e9",
+			childSuffix: ".1",
+			dbPrefix:    "bd",
+			wantPrefix:  "bd",
+			shouldMatch: true,
+		},
+		{
+			name:        "hyphenated prefix - child creation FAILS with current impl",
+			parentID:    "bead-me-up-3e9",
+			childSuffix: ".1",
+			dbPrefix:    "bead-me-up",
+			wantPrefix:  "bead-me-up", // Current impl returns "bead" - THIS IS THE BUG
+			shouldMatch: true,
+		},
+		{
+			name:        "hyphenated prefix - deeply nested child",
+			parentID:    "bead-me-up-3e9.1",
+			childSuffix: ".2",
+			dbPrefix:    "bead-me-up",
+			wantPrefix:  "bead-me-up",
+			shouldMatch: true,
+		},
+		{
+			name:        "multi-hyphen prefix - web-app style",
+			parentID:    "web-app-abc123",
+			childSuffix: ".1",
+			dbPrefix:    "web-app",
+			wantPrefix:  "web-app",
+			shouldMatch: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the child ID generation that happens in create.go:352
+			childID := tt.parentID + tt.childSuffix
+
+			// Simulate the validation flow from create.go:361
+			extractedPrefix, err := ValidateIDFormat(childID)
+			if err != nil {
+				t.Fatalf("ValidateIDFormat(%q) unexpected error: %v", childID, err)
+			}
+
+			// Check that extracted prefix matches expected
+			if extractedPrefix != tt.wantPrefix {
+				t.Errorf("ValidateIDFormat(%q) extracted prefix = %q, want %q",
+					childID, extractedPrefix, tt.wantPrefix)
+			}
+
+			// Simulate the prefix validation from create.go:389
+			// This is where the "prefix mismatch" error occurs
+			err = ValidatePrefix(extractedPrefix, tt.dbPrefix, false)
+			prefixMatches := (err == nil)
+
+			if prefixMatches != tt.shouldMatch {
+				if tt.shouldMatch {
+					t.Errorf("--parent %s flow: prefix validation failed unexpectedly: %v\n"+
+						"  Child ID: %s\n"+
+						"  Extracted prefix: %q\n"+
+						"  Database prefix: %q",
+						tt.parentID, err, childID, extractedPrefix, tt.dbPrefix)
+				} else {
+					t.Errorf("--parent %s flow: expected prefix mismatch but validation passed", tt.parentID)
+				}
 			}
 		})
 	}
@@ -126,9 +220,10 @@ func TestParseIssueType(t *testing.T) {
 		{"merge-request type", "merge-request", types.TypeMergeRequest, false, ""},
 		{"molecule type", "molecule", types.TypeMolecule, false, ""},
 		{"gate type", "gate", types.TypeGate, false, ""},
-		{"agent type", "agent", types.TypeAgent, false, ""},
-		{"role type", "role", types.TypeRole, false, ""},
+		{"event type", "event", types.TypeEvent, false, ""},
 		{"message type", "message", types.TypeMessage, false, ""},
+		// Gas Town types (agent, role, rig, convoy, slot) have been removed
+		// They now require custom type configuration,
 
 		// Case sensitivity (function is case-sensitive)
 		{"uppercase bug", "BUG", types.TypeTask, true, "invalid issue type"},
@@ -195,6 +290,43 @@ func TestValidatePrefix(t *testing.T) {
 	}
 }
 
+func TestValidatePrefixWithAllowed(t *testing.T) {
+	tests := []struct {
+		name            string
+		requestedPrefix string
+		dbPrefix        string
+		allowedPrefixes string
+		force           bool
+		wantError       bool
+	}{
+		// Basic cases (same as ValidatePrefix)
+		{"matching prefixes", "bd", "bd", "", false, false},
+		{"empty db prefix", "bd", "", "", false, false},
+		{"mismatched with force", "foo", "bd", "", true, false},
+		{"mismatched without force", "foo", "bd", "", false, true},
+
+		// Multi-prefix cases (Gas Town use case)
+		{"allowed prefix gt", "gt", "hq", "gt,hmc", false, false},
+		{"allowed prefix hmc", "hmc", "hq", "gt,hmc", false, false},
+		{"primary prefix still works", "hq", "hq", "gt,hmc", false, false},
+		{"prefix not in allowed list", "foo", "hq", "gt,hmc", false, true},
+
+		// Edge cases
+		{"allowed with spaces", "gt", "hq", "gt, hmc, foo", false, false},
+		{"empty allowed list", "gt", "hq", "", false, true},
+		{"single allowed prefix", "gt", "hq", "gt", false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePrefixWithAllowed(tt.requestedPrefix, tt.dbPrefix, tt.allowedPrefixes, tt.force)
+			if (err != nil) != tt.wantError {
+				t.Errorf("ValidatePrefixWithAllowed() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestValidateAgentID(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -215,9 +347,21 @@ func TestValidateAgentID(t *testing.T) {
 		{"valid crew", "gt-beads-crew-dave", false, ""},
 		{"valid polecat with complex name", "gt-gastown-polecat-war-boy-1", false, ""},
 
-		// Invalid: wrong prefix
-		{"wrong prefix bd", "bd-mayor", true, "must start with 'gt-'"},
-		{"wrong prefix empty", "mayor", true, "must start with 'gt-'"},
+		// Valid: alternative prefixes (beads uses bd-)
+		{"valid bd-mayor", "bd-mayor", false, ""},
+		{"valid bd-beads-polecat-pearl", "bd-beads-polecat-pearl", false, ""},
+		{"valid bd-beads-witness", "bd-beads-witness", false, ""},
+
+		// Valid: hyphenated rig names (GH#854)
+		{"hyphenated rig witness", "ob-my-project-witness", false, ""},
+		{"hyphenated rig refinery", "gt-foo-bar-refinery", false, ""},
+		{"hyphenated rig crew", "bd-my-cool-project-crew-fang", false, ""},
+		{"hyphenated rig polecat", "gt-some-long-rig-name-polecat-nux", false, ""},
+		{"hyphenated rig and name", "gt-my-rig-polecat-war-boy", false, ""},
+		{"multi-hyphen rig crew", "ob-a-b-c-d-crew-dave", false, ""},
+
+		// Invalid: no prefix (missing hyphen)
+		{"no prefix", "mayor", true, "must have a prefix followed by '-'"},
 
 		// Invalid: empty
 		{"empty id", "", true, "agent ID is required"},
@@ -226,8 +370,8 @@ func TestValidateAgentID(t *testing.T) {
 		{"unknown role", "gt-gastown-admin", true, "invalid agent format"},
 
 		// Invalid: town-level with rig (put role first)
-		{"mayor with rig suffix", "gt-gastown-mayor", true, "cannot have rig suffix"},
-		{"deacon with rig suffix", "gt-beads-deacon", true, "cannot have rig suffix"},
+		{"mayor with rig suffix", "gt-gastown-mayor", true, "cannot have rig/name suffixes"},
+		{"deacon with rig suffix", "gt-beads-deacon", true, "cannot have rig/name suffixes"},
 
 		// Invalid: per-rig role without rig
 		{"witness alone", "gt-witness", true, "requires rig"},
@@ -242,7 +386,7 @@ func TestValidateAgentID(t *testing.T) {
 		{"refinery with name", "gt-beads-refinery-extra", true, "cannot have name suffix"},
 
 		// Invalid: empty components
-		{"empty after gt", "gt-", true, "must include content after"},
+		{"empty after prefix", "gt-", true, "must include content after prefix"},
 	}
 
 	for _, tt := range tests {
