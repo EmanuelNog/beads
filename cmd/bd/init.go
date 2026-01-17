@@ -16,7 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
@@ -299,7 +299,7 @@ With --stealth: configures per-repository git settings for invisible beads usage
 		if backend == configfile.BackendDolt {
 			// Dolt uses a directory, not a file
 			storagePath = filepath.Join(beadsDir, "dolt")
-			store, err = dolt.New(ctx, &dolt.Config{Path: storagePath})
+			store, err = factory.New(ctx, backend, storagePath)
 		} else {
 			storagePath = initDBPath
 			store, err = sqlite.New(ctx, storagePath)
@@ -509,10 +509,27 @@ With --stealth: configures per-repository git settings for invisible beads usage
 
 		// Check if we're in a git repo and hooks aren't installed
 		// Install by default unless --skip-hooks is passed
+		// For Dolt backend, install hooks to .beads/hooks/ (uses git config core.hooksPath)
 		if !skipHooks && isGitRepo() && !hooksInstalled() {
-			if err := installGitHooks(); err != nil && !quiet {
-				fmt.Fprintf(os.Stderr, "\n%s Failed to install git hooks: %v\n", ui.RenderWarn("⚠"), err)
-				fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", ui.RenderAccent("bd doctor --fix"))
+			if backend == configfile.BackendDolt {
+				// Dolt backend: install hooks to .beads/hooks/
+				embeddedHooks, err := getEmbeddedHooks()
+				if err == nil {
+					if err := installHooksWithOptions(embeddedHooks, false, false, false, true); err != nil && !quiet {
+						fmt.Fprintf(os.Stderr, "\n%s Failed to install git hooks to .beads/hooks/: %v\n", ui.RenderWarn("⚠"), err)
+						fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", ui.RenderAccent("bd hooks install --beads"))
+					} else if !quiet {
+						fmt.Printf("  Hooks installed to: .beads/hooks/\n")
+					}
+				} else if !quiet {
+					fmt.Fprintf(os.Stderr, "\n%s Failed to load embedded hooks: %v\n", ui.RenderWarn("⚠"), err)
+				}
+			} else {
+				// SQLite backend: use traditional hook installation
+				if err := installGitHooks(); err != nil && !quiet {
+					fmt.Fprintf(os.Stderr, "\n%s Failed to install git hooks: %v\n", ui.RenderWarn("⚠"), err)
+					fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", ui.RenderAccent("bd doctor --fix"))
+				}
 			}
 		}
 
