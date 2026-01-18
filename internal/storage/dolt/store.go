@@ -28,6 +28,8 @@ import (
 
 	// Import Dolt driver
 	_ "github.com/dolthub/driver"
+
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 // DoltStore implements the Storage interface using Dolt
@@ -342,13 +344,19 @@ func (s *DoltStore) Checkout(ctx context.Context, branch string) error {
 	return nil
 }
 
-// Merge merges the specified branch into the current branch
-func (s *DoltStore) Merge(ctx context.Context, branch string) error {
+// Merge merges the specified branch into the current branch.
+// Returns any merge conflicts if present. Implements storage.VersionedStorage.
+func (s *DoltStore) Merge(ctx context.Context, branch string) ([]storage.Conflict, error) {
 	_, err := s.db.ExecContext(ctx, "CALL DOLT_MERGE(?)", branch)
 	if err != nil {
-		return fmt.Errorf("failed to merge branch %s: %w", branch, err)
+		// Check if the error is due to conflicts
+		conflicts, conflictErr := s.GetConflicts(ctx)
+		if conflictErr == nil && len(conflicts) > 0 {
+			return conflicts, nil
+		}
+		return nil, fmt.Errorf("failed to merge branch %s: %w", branch, err)
 	}
-	return nil
+	return nil, nil
 }
 
 // CurrentBranch returns the current branch name
@@ -436,11 +444,11 @@ func (s *DoltStore) Status(ctx context.Context) (*DoltStatus, error) {
 	for rows.Next() {
 		var tableName string
 		var staged bool
-		var statusInt int
-		if err := rows.Scan(&tableName, &staged, &statusInt); err != nil {
+		var statusStr string
+		if err := rows.Scan(&tableName, &staged, &statusStr); err != nil {
 			return nil, fmt.Errorf("failed to scan status: %w", err)
 		}
-		entry := StatusEntry{Table: tableName, Status: statusInt}
+		entry := StatusEntry{Table: tableName, Status: statusStr}
 		if staged {
 			status.Staged = append(status.Staged, entry)
 		} else {
@@ -459,5 +467,5 @@ type DoltStatus struct {
 // StatusEntry represents a changed table
 type StatusEntry struct {
 	Table  string
-	Status int // 1=new, 2=modified, 3=deleted
+	Status string // "new", "modified", "deleted"
 }

@@ -211,19 +211,18 @@ func TestParseIssueType(t *testing.T) {
 		wantError    bool
 		errorContains string
 	}{
-		// Valid issue types
+		// Core work types (always valid)
 		{"bug type", "bug", types.TypeBug, false, ""},
 		{"feature type", "feature", types.TypeFeature, false, ""},
 		{"task type", "task", types.TypeTask, false, ""},
 		{"epic type", "epic", types.TypeEpic, false, ""},
 		{"chore type", "chore", types.TypeChore, false, ""},
-		{"merge-request type", "merge-request", types.TypeMergeRequest, false, ""},
-		{"molecule type", "molecule", types.TypeMolecule, false, ""},
-		{"gate type", "gate", types.TypeGate, false, ""},
-		{"event type", "event", types.TypeEvent, false, ""},
-		{"message type", "message", types.TypeMessage, false, ""},
-		// Gas Town types (agent, role, rig, convoy, slot) have been removed
-		// They now require custom type configuration,
+		// Gas Town types require types.custom configuration (invalid without config)
+		{"merge-request type", "merge-request", types.TypeTask, true, "invalid issue type"},
+		{"molecule type", "molecule", types.TypeTask, true, "invalid issue type"},
+		{"gate type", "gate", types.TypeTask, true, "invalid issue type"},
+		{"event type", "event", types.TypeTask, true, "invalid issue type"},
+		{"message type", "message", types.TypeTask, true, "invalid issue type"},
 
 		// Case sensitivity (function is case-sensitive)
 		{"uppercase bug", "BUG", types.TypeTask, true, "invalid issue type"},
@@ -400,6 +399,46 @@ func TestValidateAgentID(t *testing.T) {
 				if !strings.Contains(err.Error(), tt.errorContains) {
 					t.Errorf("ValidateAgentID(%q) error = %q, should contain %q", tt.id, err.Error(), tt.errorContains)
 				}
+			}
+		})
+	}
+}
+
+func TestExtractAgentPrefix(t *testing.T) {
+	tests := []struct {
+		name       string
+		id         string
+		wantPrefix string
+	}{
+		// Town-level agents
+		{"mayor", "gt-mayor", "gt"},
+		{"deacon", "gt-deacon", "gt"},
+		{"bd mayor", "bd-mayor", "bd"},
+
+		// Per-rig agents
+		{"witness", "gt-gastown-witness", "gt"},
+		{"refinery", "bd-beads-refinery", "bd"},
+
+		// Named agents - the bug case
+		{"polecat 3-char name", "nx-nexus-polecat-nux", "nx"},
+		{"polecat regular", "gt-gastown-polecat-phoenix", "gt"},
+		{"crew", "gt-beads-crew-dave", "gt"},
+
+		// Hyphenated rig names
+		{"hyphenated rig", "gt-my-project-witness", "gt"},
+		{"multi-hyphen rig polecat", "bd-my-cool-app-polecat-bob", "bd"},
+
+		// Edge cases
+		{"no hyphen", "nohyphen", ""},
+		{"empty", "", ""},
+		{"just prefix", "gt-", "gt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractAgentPrefix(tt.id)
+			if got != tt.wantPrefix {
+				t.Errorf("ExtractAgentPrefix(%q) = %q, want %q", tt.id, got, tt.wantPrefix)
 			}
 		})
 	}
