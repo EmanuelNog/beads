@@ -45,7 +45,9 @@ The --manual flag shows a diff for each conflict and prompts you to choose:
   l/local  - Keep local version
   r/remote - Keep remote version
   m/merge  - Auto-merge (LWW for scalars, union for collections)
-  s/skip   - Skip and leave unresolved
+  s/skip   - Skip (keep local, conflict remains for later)
+  a/all    - Accept auto-merge for all remaining conflicts
+  q/quit   - Quit and skip all remaining conflicts
   d/diff   - Show full JSON diff
 
 The --full flag provides the legacy full sync behavior for backwards compatibility.`,
@@ -272,6 +274,17 @@ The --full flag provides the legacy full sync behavior for backwards compatibili
 			}
 		}
 		hasSyncBranchConfig := syncBranchName != ""
+
+		// GH#1166: Block sync if currently on the sync branch
+		// This must happen BEFORE worktree operations - after entering a worktree,
+		// GetCurrentBranch() would return the worktree's branch, not the original.
+		if hasSyncBranchConfig {
+			if syncbranch.IsSyncBranchSameAsCurrent(ctx, syncBranchName) {
+				FatalError("Cannot sync to '%s': it's your current branch. "+
+					"Checkout a different branch first, or use a dedicated sync branch like 'beads-sync'.",
+					syncBranchName)
+			}
+		}
 
 		// bd-wayc3: Check for redirect + sync-branch incompatibility
 		// Redirect and sync-branch are mutually exclusive:
@@ -791,7 +804,7 @@ func showSyncStateStatus(ctx context.Context, jsonlPath string) error {
 
 	// Sync mode (from config)
 	syncCfg := config.GetSyncConfig()
-	fmt.Printf("Sync mode: %s (%s)\n", syncCfg.Mode, SyncModeDescription(syncCfg.Mode))
+	fmt.Printf("Sync mode: %s (%s)\n", syncCfg.Mode, SyncModeDescription(string(syncCfg.Mode)))
 	fmt.Printf("  Export on: %s, Import on: %s\n", syncCfg.ExportOn, syncCfg.ImportOn)
 
 	// Conflict strategy
@@ -940,7 +953,7 @@ func ClearSyncConflictState(beadsDir string) error {
 //   - "ours": Keep local version
 //   - "theirs": Keep remote version
 //   - "manual": Interactive resolution with user prompts
-func resolveSyncConflicts(ctx context.Context, jsonlPath string, strategy string, dryRun bool) error {
+func resolveSyncConflicts(ctx context.Context, jsonlPath string, strategy config.ConflictStrategy, dryRun bool) error {
 	beadsDir := filepath.Dir(jsonlPath)
 
 	conflictState, err := LoadSyncConflictState(beadsDir)
@@ -1138,22 +1151,14 @@ func resolveSyncConflictsManually(ctx context.Context, jsonlPath, beadsDir strin
 	var mergedIssues []*beads.Issue
 	for id := range allIDSet {
 		if conflictIDSet[id] {
-			// This was a conflict - use the resolved version if available
+			// This was a conflict
 			if resolved, ok := resolvedMap[id]; ok {
+				// User resolved this conflict - use their choice
 				mergedIssues = append(mergedIssues, resolved)
-			}
-			// If not in resolvedMap, it was skipped - use the automatic merge result
-			if _, ok := resolvedMap[id]; !ok {
-				// Fall back to field-level merge for skipped conflicts
-				local := localMap[id]
-				remote := remoteMap[id]
-				base := baseMap[id]
-				if local != nil && remote != nil {
-					mergedIssues = append(mergedIssues, mergeFieldLevel(base, local, remote))
-				} else if local != nil {
+			} else {
+				// Skipped - keep local version in output, conflict remains for later
+				if local := localMap[id]; local != nil {
 					mergedIssues = append(mergedIssues, local)
-				} else if remote != nil {
-					mergedIssues = append(mergedIssues, remote)
 				}
 			}
 		} else {

@@ -87,17 +87,29 @@ func ValidatePrefix(requestedPrefix, dbPrefix string, force bool) error {
 // - dbPrefix is empty
 // - requestedPrefix matches dbPrefix
 // - requestedPrefix is in the comma-separated allowedPrefixes list
+// - requestedPrefix is a prefix of any entry in allowedPrefixes (GH#1135)
+//
+// The prefix-of-allowed check handles cases where ExtractIssuePrefix returns
+// a shorter prefix than intended. For example, "hq-cv-test" extracts as "hq"
+// (because "test" is word-like), but if "hq-cv" is in allowedPrefixes, we
+// should accept "hq" since it's clearly intended to be part of "hq-cv".
 // Returns an error if none of these conditions are met.
 func ValidatePrefixWithAllowed(requestedPrefix, dbPrefix, allowedPrefixes string, force bool) error {
 	if force || dbPrefix == "" || dbPrefix == requestedPrefix {
 		return nil
 	}
 
-	// Check if requestedPrefix is in the allowed list
+	// Check if requestedPrefix is in the allowed list or is a prefix of an allowed entry
 	if allowedPrefixes != "" {
 		for _, allowed := range strings.Split(allowedPrefixes, ",") {
 			allowed = strings.TrimSpace(allowed)
 			if allowed == requestedPrefix {
+				return nil
+			}
+			// GH#1135: Also accept if requestedPrefix is a prefix of an allowed entry.
+			// This handles IDs like "hq-cv-test" where extraction yields "hq" but
+			// the user configured "hq-cv" in allowed_prefixes.
+			if strings.HasPrefix(allowed, requestedPrefix+"-") {
 				return nil
 			}
 		}
@@ -109,6 +121,49 @@ func ValidatePrefixWithAllowed(requestedPrefix, dbPrefix, allowedPrefixes string
 			dbPrefix, allowedPrefixes, requestedPrefix)
 	}
 	return fmt.Errorf("prefix mismatch: database uses '%s' but you specified '%s' (use --force to override)", dbPrefix, requestedPrefix)
+}
+
+// ValidateIDPrefixAllowed checks that an issue ID's prefix is allowed.
+// Unlike ValidatePrefixWithAllowed which takes an extracted prefix, this function
+// takes the full ID and checks if it starts with any allowed prefix.
+// This correctly handles multi-hyphen prefixes like "hq-cv-" where the suffix
+// might look like an English word (e.g., "hq-cv-test").
+// (GH#1135)
+//
+// It matches if:
+// - force is true
+// - dbPrefix is empty
+// - id starts with dbPrefix + "-"
+// - id starts with any prefix in allowedPrefixes + "-"
+// Returns an error if none of these conditions are met.
+func ValidateIDPrefixAllowed(id, dbPrefix, allowedPrefixes string, force bool) error {
+	if force || dbPrefix == "" {
+		return nil
+	}
+
+	// Check if ID starts with the database prefix
+	if strings.HasPrefix(id, dbPrefix+"-") {
+		return nil
+	}
+
+	// Check if ID starts with any allowed prefix
+	if allowedPrefixes != "" {
+		for _, allowed := range strings.Split(allowedPrefixes, ",") {
+			allowed = strings.TrimSpace(allowed)
+			// Normalize: remove trailing - if present (we add it for matching)
+			allowed = strings.TrimSuffix(allowed, "-")
+			if allowed != "" && strings.HasPrefix(id, allowed+"-") {
+				return nil
+			}
+		}
+	}
+
+	// Build helpful error message
+	if allowedPrefixes != "" {
+		return fmt.Errorf("prefix mismatch: database uses '%s-' (allowed: %s) but ID '%s' doesn't match any allowed prefix (use --force to override)",
+			dbPrefix, allowedPrefixes, id)
+	}
+	return fmt.Errorf("prefix mismatch: database uses '%s-' but ID '%s' doesn't match (use --force to override)", dbPrefix, id)
 }
 
 // ValidAgentRoles are the known agent role types for ID pattern validation
