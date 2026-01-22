@@ -260,7 +260,7 @@ The --full flag provides the legacy full sync behavior for backwards compatibili
 				fmt.Println("→ [DRY RUN] Would import from JSONL")
 			} else {
 				fmt.Println("→ Importing from JSONL...")
-				if err := importFromJSONLInline(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
+				if err := importFromJSONLInline(ctx, jsonlPath, renameOnImport, noGitHistory, false); err != nil {
 					FatalError("importing: %v", err)
 				}
 				fmt.Println("✓ Import complete")
@@ -344,11 +344,11 @@ The --full flag provides the legacy full sync behavior for backwards compatibili
 		// GH#1166: Block sync if currently on the sync branch
 		// This must happen BEFORE worktree operations - after entering a worktree,
 		// GetCurrentBranch() would return the worktree's branch, not the original.
-		if hasSyncBranchConfig {
-			if syncbranch.IsSyncBranchSameAsCurrent(ctx, syncBranchName) {
+		if sbc.IsConfigured() {
+			if syncbranch.IsSyncBranchSameAsCurrent(ctx, sbc.Branch) {
 				FatalError("Cannot sync to '%s': it's your current branch. "+
 					"Checkout a different branch first, or use a dedicated sync branch like 'beads-sync'.",
-					syncBranchName)
+					sbc.Branch)
 			}
 		}
 
@@ -772,8 +772,8 @@ func doExportSync(ctx context.Context, jsonlPath string, force, dryRun bool) err
 			}
 		}
 
-		// Export to JSONL
-		result, err := exportToJSONLDeferred(ctx, jsonlPath)
+		// Export to JSONL (uses incremental export for large repos)
+		result, err := exportToJSONLIncrementalDeferred(ctx, jsonlPath)
 		if err != nil {
 			return fmt.Errorf("exporting: %w", err)
 		}
@@ -924,6 +924,7 @@ type SyncConflictRecord struct {
 // LoadSyncConflictState loads the sync conflict state from disk.
 func LoadSyncConflictState(beadsDir string) (*SyncConflictState, error) {
 	path := filepath.Join(beadsDir, "sync_conflicts.json")
+	// #nosec G304 -- path is derived from the workspace .beads directory
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1023,7 +1024,7 @@ func resolveSyncConflicts(ctx context.Context, jsonlPath string, strategy config
 
 	// Handle manual strategy with interactive resolution
 	if strategy == config.ConflictStrategyManual {
-		return resolveSyncConflictsManually(ctx, jsonlPath, beadsDir, conflictState, baseMap, localMap, remoteMap, baseIssues, localIssues, remoteIssues)
+		return resolveSyncConflictsManually(ctx, jsonlPath, beadsDir, conflictState, baseMap, localMap, remoteMap)
 	}
 
 	resolved := 0
@@ -1076,7 +1077,7 @@ func resolveSyncConflicts(ctx context.Context, jsonlPath string, strategy config
 	}
 
 	// Import to database
-	if err := importFromJSONLInline(ctx, jsonlPath, false, false); err != nil {
+	if err := importFromJSONLInline(ctx, jsonlPath, false, false, false); err != nil {
 		return fmt.Errorf("importing merged state: %w", err)
 	}
 
@@ -1101,8 +1102,7 @@ func resolveSyncConflicts(ctx context.Context, jsonlPath string, strategy config
 
 // resolveSyncConflictsManually handles manual conflict resolution with interactive prompts.
 func resolveSyncConflictsManually(ctx context.Context, jsonlPath, beadsDir string, conflictState *SyncConflictState,
-	baseMap, localMap, remoteMap map[string]*beads.Issue,
-	baseIssues, localIssues, remoteIssues []*beads.Issue) error {
+	baseMap, localMap, remoteMap map[string]*beads.Issue) error {
 
 	// Build interactive conflicts list
 	var interactiveConflicts []InteractiveConflict
@@ -1209,7 +1209,7 @@ func resolveSyncConflictsManually(ctx context.Context, jsonlPath, beadsDir strin
 	}
 
 	// Import to database
-	if err := importFromJSONLInline(ctx, jsonlPath, false, false); err != nil {
+	if err := importFromJSONLInline(ctx, jsonlPath, false, false, false); err != nil {
 		return fmt.Errorf("importing merged state: %w", err)
 	}
 

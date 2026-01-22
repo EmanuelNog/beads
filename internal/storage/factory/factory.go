@@ -4,7 +4,6 @@ package factory
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/steveyegge/beads/internal/configfile"
@@ -27,6 +26,11 @@ func RegisterBackend(name string, factory BackendFactory) {
 type Options struct {
 	ReadOnly    bool
 	LockTimeout time.Duration
+
+	// Dolt server mode options (federation)
+	ServerMode bool   // Connect to dolt sql-server instead of embedded
+	ServerHost string // Server host (default: 127.0.0.1)
+	ServerPort int    // Server port (default: 3306)
 }
 
 // New creates a storage backend based on the backend type.
@@ -84,9 +88,7 @@ func NewFromConfigWithOptions(ctx context.Context, beadsDir string, opts Options
 	case configfile.BackendSQLite:
 		return NewWithOptions(ctx, backend, cfg.DatabasePath(beadsDir), opts)
 	case configfile.BackendDolt:
-		// For Dolt, use a subdirectory to store the Dolt database
-		doltPath := filepath.Join(beadsDir, "dolt")
-		return NewWithOptions(ctx, backend, doltPath, opts)
+		return NewWithOptions(ctx, backend, cfg.DatabasePath(beadsDir), opts)
 	default:
 		return nil, fmt.Errorf("unknown storage backend in config: %s", backend)
 	}
