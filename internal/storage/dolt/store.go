@@ -262,6 +262,11 @@ func openEmbeddedConnection(ctx context.Context, cfg *Config) (*sql.DB, string, 
 		return nil, "", fmt.Errorf("failed to connect to Dolt database after %d retries: %w", cfg.LockRetries, lastErr)
 	}
 
+	// Disable statistics collection to avoid stats subdatabase lock issues
+	// The stats database can cause "cannot update manifest: database is read only"
+	// errors when multiple processes access the embedded Dolt database
+	_, _ = db.ExecContext(ctx, "SET @@dolt_stats_enabled = 0")
+
 	return db, connStr, nil
 }
 
@@ -307,8 +312,13 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 
 	_, err = initDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", cfg.Database))
 	if err != nil {
-		_ = db.Close()
-		return nil, "", fmt.Errorf("failed to create database: %w", err)
+		// Dolt may return error 1007 even with IF NOT EXISTS - ignore if database already exists
+		errLower := strings.ToLower(err.Error())
+		if !strings.Contains(errLower, "database exists") && !strings.Contains(errLower, "1007") {
+			_ = db.Close()
+			return nil, "", fmt.Errorf("failed to create database: %w", err)
+		}
+		// Database already exists - that's fine, continue
 	}
 
 	return db, connStr, nil
