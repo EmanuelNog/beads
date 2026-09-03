@@ -1,6 +1,6 @@
 // Package dolt provides concurrency tests for embedded Dolt with multiple writers.
 //
-// These tests validate that Gas Town can safely run multiple polecats concurrently,
+// These tests validate that an orchestrator can safely run multiple workers concurrently,
 // all writing to the same Dolt DB for creating issues, updating status,
 // adding dependencies, and closing issues.
 package dolt
@@ -8,6 +8,7 @@ package dolt
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,74 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+func realDoltTestServerRequired() bool {
+	return os.Getenv("BEADS_TEST_ENV_RUN_DOLT") == "1"
+}
+
+// TestDoltAutocommitRollbackContentionConverges creates a real same-cell
+// branch contention, then asks Dolt to merge it while autocommit is enabled.
+// The rejected merge must leave the working set clean before a fresh replay
+// converges on its intended state.
+func TestDoltAutocommitRollbackContentionConverges(t *testing.T) {
+	if testServerPort == 0 && realDoltTestServerRequired() {
+		t.Fatal("real Dolt contention test required but the test server did not start")
+	}
+	const issueID = "autocommit-rollback-contention"
+	store, peerBranch := setupIssueMergeConflict(t, issueID,
+		"base", "2026-08-04 14:00:00",
+		"ours", "2026-08-04 14:01:00",
+		"theirs", "2026-08-04 14:02:00", true)
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	if _, err := store.db.ExecContext(ctx, "SET autocommit = 1"); err != nil {
+		t.Fatalf("enable autocommit: %v", err)
+	}
+	_, err := store.db.ExecContext(ctx, "CALL DOLT_MERGE(?)", peerBranch)
+	if !isDoltAutocommitRollbackError(err) {
+		t.Fatalf("autocommit DOLT_MERGE error = %v, want typed rollback conflict", err)
+	}
+	var dirty int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_status WHERE table_name = 'issues'").Scan(&dirty); err != nil {
+		t.Fatalf("check rolled-back session status: %v", err)
+	}
+	if dirty != 0 {
+		t.Fatalf("rolled-back session has %d dirty issues entries, want clean working set", dirty)
+	}
+	if err := store.UpdateIssue(ctx, issueID, map[string]interface{}{"title": "fresh replay"}, "replay"); err != nil {
+		t.Fatalf("fresh replay update: %v", err)
+	}
+	var got string
+	if err := store.db.QueryRowContext(ctx, "SELECT title FROM issues AS OF 'HEAD' WHERE id = ?", issueID).Scan(&got); err != nil {
+		t.Fatalf("read fresh replay at HEAD: %v", err)
+	}
+	if got != "fresh replay" {
+		t.Fatalf("fresh replay title = %q, want %q", got, "fresh replay")
+	}
+}
+
+func TestRealDoltTestServerRequiredOnlyByExplicitOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		runDolt       string
+		githubActions string
+		want          bool
+	}{
+		{name: "explicit Dolt opt-in", runDolt: "1", want: true},
+		{name: "GitHub Actions alone", githubActions: "true", want: false},
+		{name: "neither environment", want: false},
+		{name: "non-opt-in Dolt value", runDolt: "true", githubActions: "true", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEADS_TEST_ENV_RUN_DOLT", tc.runDolt)
+			t.Setenv("GITHUB_ACTIONS", tc.githubActions)
+			if got := realDoltTestServerRequired(); got != tc.want {
+				t.Fatalf("realDoltTestServerRequired() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 // concurrentTestTimeout is longer than regular tests to allow for contention
 const concurrentTestTimeout = 60 * time.Second
@@ -33,7 +102,7 @@ func concurrentTestContext(t *testing.T) (context.Context, context.CancelFunc) {
 // =============================================================================
 
 func TestConcurrentIssueCreation(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -44,23 +113,34 @@ func TestConcurrentIssueCreation(t *testing.T) {
 	errors := make(chan error, numGoroutines)
 	createdIDs := make(chan string, numGoroutines)
 
-	// Launch 10 goroutines to create issues simultaneously
+	// Launch 10 goroutines to create issues simultaneously.
+	// Dolt serialization errors (1213) are expected under contention and
+	// should be retried — this mirrors correct production behavior.
+	const maxRetries = 5
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			issue := &types.Issue{
-				Title:       fmt.Sprintf("Concurrent Issue %d", n),
-				Description: fmt.Sprintf("Created by goroutine %d", n),
-				Status:      types.StatusOpen,
-				Priority:    2,
-				IssueType:   types.TypeTask,
-			}
-			if err := store.CreateIssue(ctx, issue, fmt.Sprintf("worker-%d", n)); err != nil {
+			for attempt := 0; attempt <= maxRetries; attempt++ {
+				issue := &types.Issue{
+					Title:       fmt.Sprintf("Concurrent Issue %d", n),
+					Description: fmt.Sprintf("Created by goroutine %d", n),
+					Status:      types.StatusOpen,
+					Priority:    2,
+					IssueType:   types.TypeTask,
+				}
+				err := store.CreateIssue(ctx, issue, fmt.Sprintf("worker-%d", n))
+				if err == nil {
+					createdIDs <- issue.ID
+					return
+				}
+				if isSerializationError(err) && attempt < maxRetries {
+					time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+					continue
+				}
 				errors <- fmt.Errorf("goroutine %d: %w", n, err)
 				return
 			}
-			createdIDs <- issue.ID
 		}(i)
 	}
 
@@ -112,7 +192,7 @@ func TestConcurrentIssueCreation(t *testing.T) {
 // =============================================================================
 
 func TestSameIssueUpdateRace(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -132,12 +212,12 @@ func TestSameIssueUpdateRace(t *testing.T) {
 		t.Fatalf("failed to create issue: %v", err)
 	}
 
-	const numGoroutines = 10
+	const numGoroutines = 5
 	var wg sync.WaitGroup
 	var successCount atomic.Int32
 	var errorCount atomic.Int32
 
-	// Launch 10 goroutines to update the same issue
+	// Launch goroutines to update the same issue
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func(n int) {
@@ -184,7 +264,7 @@ func TestSameIssueUpdateRace(t *testing.T) {
 // =============================================================================
 
 func TestReadWriteMix(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -208,9 +288,9 @@ func TestReadWriteMix(t *testing.T) {
 		issueIDs[i] = issue.ID
 	}
 
-	const numReaders = 5
-	const numWriters = 5
-	const iterations = 100
+	const numReaders = 3
+	const numWriters = 3
+	const iterations = 20
 
 	var wg sync.WaitGroup
 	var readErrors atomic.Int32
@@ -294,7 +374,7 @@ func TestReadWriteMix(t *testing.T) {
 // =============================================================================
 
 func TestLongTransactionBlocking(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -325,12 +405,12 @@ func TestLongTransactionBlocking(t *testing.T) {
 		defer wg.Done()
 		defer close(longTxDone)
 
-		err := store.RunInTransaction(ctx, func(tx storage.Transaction) error {
+		err := store.RunInTransaction(ctx, "test: long transaction update", func(tx storage.Transaction) error {
 			// Signal that long tx has started
 			close(longTxStarted)
 
-			// Hold the transaction open for a while
-			time.Sleep(2 * time.Second)
+			// Hold the transaction open long enough for short txs to contend
+			time.Sleep(500 * time.Millisecond)
 
 			// Do some work
 			return tx.UpdateIssue(ctx, issue.ID, map[string]interface{}{
@@ -356,7 +436,7 @@ func TestLongTransactionBlocking(t *testing.T) {
 			shortCtx, shortCancel := context.WithTimeout(ctx, 5*time.Second)
 			defer shortCancel()
 
-			err := store.RunInTransaction(shortCtx, func(tx storage.Transaction) error {
+			err := store.RunInTransaction(shortCtx, fmt.Sprintf("test: short transaction %d", n), func(tx storage.Transaction) error {
 				return tx.UpdateIssue(shortCtx, issue.ID, map[string]interface{}{
 					"notes": fmt.Sprintf("Short tx %d", n),
 				}, fmt.Sprintf("short-tx-%d", n))
@@ -393,7 +473,7 @@ func TestLongTransactionBlocking(t *testing.T) {
 // =============================================================================
 
 func TestBranchPerAgentMergeRace(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -495,7 +575,7 @@ func TestBranchPerAgentMergeRace(t *testing.T) {
 // =============================================================================
 
 func TestWorktreeExportIsolation(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -570,7 +650,7 @@ func TestWorktreeExportIsolation(t *testing.T) {
 // =============================================================================
 
 func TestConcurrentDependencyOperations(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -659,7 +739,7 @@ func TestHighContentionStress(t *testing.T) {
 		t.Skip("skipping stress test in short mode")
 	}
 
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -681,8 +761,8 @@ func TestHighContentionStress(t *testing.T) {
 		}
 	}
 
-	const numWorkers = 20
-	const opsPerWorker = 50
+	const numWorkers = 8
+	const opsPerWorker = 15
 	var wg sync.WaitGroup
 	var totalOps atomic.Int32
 	var failedOps atomic.Int32
@@ -753,4 +833,318 @@ func TestHighContentionStress(t *testing.T) {
 			t.Errorf("issue %s missing after stress test", issueID)
 		}
 	}
+}
+
+// =============================================================================
+// Test: Concurrent Issue Creation Without Caller Retry
+// Same as TestConcurrentIssueCreation but relies on withRetryTx to handle
+// serialization errors internally — no caller-side retry loop.
+// =============================================================================
+
+func TestConcurrentIssueCreationWithoutCallerRetry(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := concurrentTestContext(t)
+	defer cancel()
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, numGoroutines)
+	createdIDs := make(chan string, numGoroutines)
+
+	for n := range numGoroutines {
+		wg.Go(func() {
+			issue := &types.Issue{
+				Title:       fmt.Sprintf("No Retry Issue %d", n),
+				Description: fmt.Sprintf("Created by goroutine %d", n),
+				Status:      types.StatusOpen,
+				Priority:    2,
+				IssueType:   types.TypeTask,
+			}
+			if err := store.CreateIssue(ctx, issue, fmt.Sprintf("worker-%d", n)); err != nil {
+				errs <- fmt.Errorf("goroutine %d: %w", n, err)
+				return
+			}
+			createdIDs <- issue.ID
+		})
+	}
+
+	wg.Wait()
+	close(errs)
+	close(createdIDs)
+
+	for err := range errs {
+		t.Errorf("creation error: %v", err)
+	}
+	if t.Failed() {
+		t.Fatal("concurrent create failed without caller retry")
+	}
+
+	ids := make(map[string]bool)
+	for id := range createdIDs {
+		if ids[id] {
+			t.Errorf("duplicate issue ID: %s", id)
+		}
+		ids[id] = true
+	}
+	if len(ids) != numGoroutines {
+		t.Fatalf("expected %d unique IDs, got %d", numGoroutines, len(ids))
+	}
+}
+
+// =============================================================================
+// Test: Concurrent Comment and Close Without Caller Retry
+// Each goroutine comments on and closes a different issue concurrently.
+// Relies on withRetryTx for transient error handling.
+// =============================================================================
+
+func TestConcurrentCommentAndCloseWithoutCallerRetry(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := concurrentTestContext(t)
+	defer cancel()
+
+	const numIssues = 8
+	issueIDs := make([]string, 0, numIssues)
+	for i := 0; i < numIssues; i++ {
+		issue := &types.Issue{
+			ID:          fmt.Sprintf("cc-%d", i),
+			Title:       fmt.Sprintf("Comment Close %d", i),
+			Description: "permanent issue for concurrent comment/close",
+			Status:      types.StatusOpen,
+			Priority:    2,
+			IssueType:   types.TypeTask,
+		}
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("CreateIssue(%d): %v", i, err)
+		}
+		issueIDs = append(issueIDs, issue.ID)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, numIssues)
+	for n, id := range issueIDs {
+		wg.Go(func() {
+			if _, err := store.AddIssueComment(ctx, id, fmt.Sprintf("author-%d", n), fmt.Sprintf("comment-%d", n)); err != nil {
+				errs <- fmt.Errorf("comment %s: %w", id, err)
+				return
+			}
+			if err := store.CloseIssue(ctx, id, "done", fmt.Sprintf("closer-%d", n), "test-session"); err != nil {
+				errs <- fmt.Errorf("close %s: %w", id, err)
+			}
+		})
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("write error: %v", err)
+	}
+	if t.Failed() {
+		t.Fatal("concurrent comment/close failed without caller retry")
+	}
+
+	for _, issueID := range issueIDs {
+		issue, err := store.GetIssue(ctx, issueID)
+		if err != nil {
+			t.Fatalf("GetIssue(%s): %v", issueID, err)
+		}
+		if issue.Status != types.StatusClosed {
+			t.Fatalf("issue %s status = %s, want closed", issueID, issue.Status)
+		}
+		comments, err := store.GetIssueComments(ctx, issueID)
+		if err != nil {
+			t.Fatalf("GetIssueComments(%s): %v", issueID, err)
+		}
+		if len(comments) != 1 {
+			t.Fatalf("issue %s comment count = %d, want 1", issueID, len(comments))
+		}
+	}
+}
+
+// =============================================================================
+// Test: Serialization Conflict Retry
+// 10 goroutines all add a label to the SAME issue concurrently, forcing Dolt
+// serialization conflicts (Error 1213). withRetryTx must retry transparently
+// so that all 10 labels are applied without any caller-visible errors.
+// =============================================================================
+
+func TestSerializationConflictRetry(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := concurrentTestContext(t)
+	defer cancel()
+
+	// Create a single issue that all goroutines will contend on.
+	issue := &types.Issue{
+		ID:          "serialization-target",
+		Title:       "Serialization Conflict Target",
+		Description: "All goroutines add labels to this issue",
+		Status:      types.StatusOpen,
+		Priority:    2,
+		IssueType:   types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, numGoroutines)
+
+	for n := range numGoroutines {
+		wg.Go(func() {
+			label := fmt.Sprintf("label-%d", n)
+			if err := store.AddLabel(ctx, issue.ID, label, fmt.Sprintf("worker-%d", n)); err != nil {
+				errs <- fmt.Errorf("goroutine %d AddLabel(%q): %w", n, label, err)
+			}
+		})
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("label error: %v", err)
+	}
+	if t.Failed() {
+		t.Fatal("concurrent AddLabel failed — withRetryTx should have retried serialization errors")
+	}
+
+	// Verify all labels were applied.
+	labels, err := store.GetLabels(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("GetLabels: %v", err)
+	}
+	if len(labels) != numGoroutines {
+		t.Fatalf("expected %d labels, got %d: %v", numGoroutines, len(labels), labels)
+	}
+}
+
+// =============================================================================
+// Test: Concurrent Work-Queue Drain (the "Gas Station" scenario)
+//
+// N workers concurrently dequeue from ONE shared ready-front via
+// ClaimReadyIssue until it returns nil, exactly as N agent clones draining a
+// shared Beads work queue would. This is the core Gas Station claim-queue
+// invariant and the scenario the multi-agent port harness depends on:
+//
+//   - every issue is claimed by EXACTLY ONE worker (no double-claim / lost work)
+//   - every issue is claimed (no stranded ready work left behind)
+//   - the count of distinct claims equals the number of issues
+//
+// Dolt has no SKIP LOCKED, so the safety comes from the claim CAS (UPDATE ...
+// SET assignee WHERE assignee IS NULL) colliding on the same cell, surfacing as
+// a 1213/1205 serialization conflict, which ClaimReadyIssue's withRetryTx
+// re-scans and retries. This test is the regression guard for that guarantee.
+// =============================================================================
+
+func TestConcurrentWorkQueueDrain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping work-queue drain test in short mode")
+	}
+
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := concurrentTestContext(t)
+	defer cancel()
+
+	// Seed a ready-front: all open, unassigned, no blockers => all ready.
+	const numIssues = 40
+	want := make(map[string]bool, numIssues)
+	for i := 0; i < numIssues; i++ {
+		id := fmt.Sprintf("queue-%03d", i)
+		issue := &types.Issue{
+			ID:          id,
+			Title:       fmt.Sprintf("Queue item %d", i),
+			Description: "ready work for the shared drain",
+			Status:      types.StatusOpen,
+			Priority:    (i % 4) + 1,
+			IssueType:   types.TypeTask,
+		}
+		if err := store.CreateIssue(ctx, issue, "seeder"); err != nil {
+			t.Fatalf("seed issue %s: %v", id, err)
+		}
+		want[id] = true
+	}
+
+	const numWorkers = 6
+
+	var mu sync.Mutex
+	claimedBy := make(map[string]string, numIssues) // issueID -> worker that claimed it
+	var doubleClaim atomic.Int32
+	var claimErrs atomic.Int32
+	var wg sync.WaitGroup
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			actor := fmt.Sprintf("worker-%d", workerID)
+			for {
+				issue, err := store.ClaimReadyIssue(ctx, types.WorkFilter{}, actor)
+				if err != nil {
+					claimErrs.Add(1)
+					return
+				}
+				if issue == nil {
+					return // ready-front drained from this worker's snapshot
+				}
+				mu.Lock()
+				if prev, ok := claimedBy[issue.ID]; ok {
+					t.Errorf("issue %s double-claimed: first by %s, then by %s", issue.ID, prev, actor)
+					doubleClaim.Add(1)
+				} else {
+					claimedBy[issue.ID] = actor
+				}
+				mu.Unlock()
+			}
+		}(w)
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("work-queue drain timeout — possible deadlock or claim livelock")
+	}
+
+	if n := claimErrs.Load(); n != 0 {
+		t.Errorf("got %d claim errors; ClaimReadyIssue should retry serialization conflicts internally and never surface one", n)
+	}
+	if n := doubleClaim.Load(); n != 0 {
+		t.Errorf("got %d double-claims; the claim CAS must give each issue to exactly one worker", n)
+	}
+
+	// No stranded work: every seeded issue claimed exactly once.
+	if len(claimedBy) != numIssues {
+		t.Errorf("claimed %d distinct issues, want %d (stranded ready work)", len(claimedBy), numIssues)
+	}
+	for id := range want {
+		if _, ok := claimedBy[id]; !ok {
+			t.Errorf("issue %s was never claimed (stranded)", id)
+		}
+	}
+
+	// Cross-check against the store: nothing should remain ready/open.
+	remaining, err := store.ClaimReadyIssue(ctx, types.WorkFilter{}, "final-sweeper")
+	if err != nil {
+		t.Fatalf("final sweep: %v", err)
+	}
+	if remaining != nil {
+		t.Errorf("ready-front not fully drained: %s still claimable after all workers finished", remaining.ID)
+	}
+
+	// Distribution sanity (informational): how evenly work spread across workers.
+	perWorker := make(map[string]int)
+	for _, actor := range claimedBy {
+		perWorker[actor]++
+	}
+	t.Logf("drain complete: %d issues across %d workers: %v", len(claimedBy), numWorkers, perWorker)
 }

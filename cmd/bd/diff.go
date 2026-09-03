@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -11,10 +12,10 @@ import (
 var diffCmd = &cobra.Command{
 	Use:     "diff <from-ref> <to-ref>",
 	GroupID: "views",
-	Short:   "Show changes between two commits or branches (requires Dolt backend)",
+	Short:   "Show changes between two commits or branches",
 	Long: `Show the differences in issues between two commits or branches.
 
-This command requires the Dolt storage backend. The refs can be:
+The refs can be:
 - Commit hashes (e.g., abc123def)
 - Branch names (e.g., main, feature-branch)
 - Special refs like HEAD, HEAD~1
@@ -23,32 +24,36 @@ Examples:
   bd diff main feature-branch   # Compare main to feature branch
   bd diff HEAD~5 HEAD           # Show changes in last 5 commits
   bd diff abc123 def456         # Compare two specific commits`,
-	Args: cobra.ExactArgs(2),
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.ExactArgs(2),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("diff is not supported in proxied-server mode")
+		}
+		evt := metrics.NewCommandEvent("diff")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		ctx := rootCtx
 		fromRef := args[0]
 		toRef := args[1]
 
-		// Check if storage supports versioning
-		vs, ok := storage.AsVersioned(store)
-		if !ok {
-			FatalErrorRespectJSON("diff requires Dolt backend (current backend does not support versioning)")
-		}
-
-		// Get diff between refs
-		entries, err := vs.Diff(ctx, fromRef, toRef)
+		entries, err := store.Diff(ctx, fromRef, toRef)
 		if err != nil {
-			FatalErrorRespectJSON("failed to get diff: %v", err)
+			return HandleErrorRespectJSON("failed to get diff: %v", err)
 		}
 
 		if len(entries) == 0 {
 			fmt.Printf("No changes between %s and %s\n", fromRef, toRef)
-			return
+			return nil
 		}
 
 		if jsonOutput {
-			outputJSON(entries)
-			return
+			return outputJSON(entries)
 		}
 
 		// Display diff in human-readable format
@@ -117,7 +122,6 @@ Examples:
 			fmt.Println()
 		}
 
-		// Display removed issues
 		if len(removed) > 0 {
 			fmt.Printf("%s Removed (%d):\n", ui.RenderAccent("-"), len(removed))
 			for _, entry := range removed {
@@ -131,6 +135,7 @@ Examples:
 			}
 			fmt.Println()
 		}
+		return nil
 	},
 }
 

@@ -1,27 +1,128 @@
 package dolt
 
 import (
+	"context"
+	"strings"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// TestDoltStoreImplementsVersionedStorage verifies DoltStore implements VersionedStorage.
-// This is a compile-time check.
-func TestDoltStoreImplementsVersionedStorage(t *testing.T) {
-	// The var _ declaration in versioned.go already ensures this at compile time.
-	// This test just documents the expectation.
+// migration0049DDL replays migration 0049's exact column widening: the four
+// issues text columns move from TEXT to LONGTEXT NOT NULL. See
+// internal/storage/schema/cli_migrations.go (cliMigration0049LongtextLargeContentColumns).
+const migration0049DDL = "ALTER TABLE issues " +
+	"MODIFY COLUMN description LONGTEXT NOT NULL, " +
+	"MODIFY COLUMN design LONGTEXT NOT NULL, " +
+	"MODIFY COLUMN acceptance_criteria LONGTEXT NOT NULL, " +
+	"MODIFY COLUMN notes LONGTEXT NOT NULL"
 
-	var _ storage.VersionedStorage = (*DoltStore)(nil)
+// alterIssuesTextColumnsDown simulates the pre-0049 schema by narrowing the
+// four issues text columns from LONGTEXT back to TEXT, without touching any
+// row data.
+func alterIssuesTextColumnsDown(t *testing.T, ctx context.Context, store *DoltStore) {
+	t.Helper()
+	const ddl = "ALTER TABLE issues " +
+		"MODIFY COLUMN description TEXT NOT NULL, " +
+		"MODIFY COLUMN design TEXT NOT NULL, " +
+		"MODIFY COLUMN acceptance_criteria TEXT NOT NULL, " +
+		"MODIFY COLUMN notes TEXT NOT NULL"
+	if _, err := store.db.ExecContext(ctx, ddl); err != nil {
+		t.Fatalf("failed to narrow issues text columns to TEXT: %v", err)
+	}
 }
 
-// TestVersionedStorageMethodsExist ensures all required methods are defined.
-// This is mostly a documentation test since Go's type system enforces this.
-func TestVersionedStorageMethodsExist(t *testing.T) {
-	// If DoltStore doesn't implement all VersionedStorage methods,
-	// this file won't compile. This test exists for documentation.
-	t.Log("DoltStore implements all VersionedStorage methods")
+// TestHistory_NullTextColumns reproduces GH#4867: dolt_history_issues
+// projects every historical row against the CURRENT branch-head schema. A
+// row committed while the issues text columns were still TEXT (pre-0049)
+// type-mismatches the post-0049 LONGTEXT column definition when Dolt
+// re-projects it, which surfaces as NULL rather than the original value.
+// This is real migration behavior, not a hand-written NULL row: schema
+// widening never mutates existing row bytes, only the type Dolt uses to
+// project them.
+func TestHistory_NullTextColumns(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// (a) Simulate the pre-0049 schema: TEXT columns, not yet migrated.
+	alterIssuesTextColumnsDown(t, ctx, store)
+	if err := store.Commit(ctx, "narrow issues text columns to TEXT (pre-0049 schema)"); err != nil {
+		t.Fatalf("failed to commit TEXT schema: %v", err)
+	}
+
+	// (b) Commit an issue under the pre-0049 TEXT schema. This becomes the
+	// OLDER history entry.
+	issue := &types.Issue{
+		ID:                 "null-hist-1",
+		Title:              "Null history test",
+		Description:        "original description",
+		Design:             "original design",
+		AcceptanceCriteria: "original AC",
+		Notes:              "original notes",
+		Status:             types.StatusOpen,
+		Priority:           2,
+		IssueType:          types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("failed to create issue: %v", err)
+	}
+	if err := store.Commit(ctx, "initial commit under TEXT schema"); err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+
+	// (c) Replay migration 0049's exact DDL, widening to LONGTEXT. The row
+	// data is untouched; only the branch-head column type changes. This
+	// becomes the NEWEST history entry.
+	if _, err := store.db.ExecContext(ctx, migration0049DDL); err != nil {
+		t.Fatalf("failed to replay migration 0049 DDL: %v", err)
+	}
+	if err := store.Commit(ctx, "replay migration 0049 (TEXT -> LONGTEXT)"); err != nil {
+		t.Fatalf("failed to commit migration 0049: %v", err)
+	}
+
+	history, err := store.History(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("History() failed across a TEXT -> LONGTEXT migration: %v", err)
+	}
+	if len(history) < 2 {
+		t.Fatalf("expected at least 2 history entries, got %d", len(history))
+	}
+
+	// Newest entry (post-migration commit): schema matches branch head, so
+	// the real values project through untouched.
+	newest := history[0].Issue
+	if newest.Description != issue.Description {
+		t.Errorf("expected newest description %q, got %q", issue.Description, newest.Description)
+	}
+	if newest.Design != issue.Design {
+		t.Errorf("expected newest design %q, got %q", issue.Design, newest.Design)
+	}
+	if newest.AcceptanceCriteria != issue.AcceptanceCriteria {
+		t.Errorf("expected newest acceptance_criteria %q, got %q", issue.AcceptanceCriteria, newest.AcceptanceCriteria)
+	}
+	if newest.Notes != issue.Notes {
+		t.Errorf("expected newest notes %q, got %q", issue.Notes, newest.Notes)
+	}
+
+	// Older entry (pre-migration commit, TEXT-era): re-projected against the
+	// current LONGTEXT schema, the type mismatch surfaces as NULL, which the
+	// COALESCE in the scan turns into "".
+	older := history[1].Issue
+	if older.Description != "" {
+		t.Errorf("expected pre-migration description to coalesce to \"\", got %q", older.Description)
+	}
+	if older.Design != "" {
+		t.Errorf("expected pre-migration design to coalesce to \"\", got %q", older.Design)
+	}
+	if older.AcceptanceCriteria != "" {
+		t.Errorf("expected pre-migration acceptance_criteria to coalesce to \"\", got %q", older.AcceptanceCriteria)
+	}
+	if older.Notes != "" {
+		t.Errorf("expected pre-migration notes to coalesce to \"\", got %q", older.Notes)
+	}
 }
 
 // TestCommitExists tests the CommitExists method.
@@ -102,245 +203,123 @@ func TestCommitExists(t *testing.T) {
 	})
 }
 
-// TestGetChangesSinceExport tests the GetChangesSinceExport method.
-func TestGetChangesSinceExport(t *testing.T) {
+// TestCommitPending tests the batch commit mechanism.
+func TestCommitPending(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	t.Run("empty commit returns needsFullExport", func(t *testing.T) {
-		result, err := store.GetChangesSinceExport(ctx, "")
+	// Initial commit so the store has a clean HEAD
+	if err := store.Commit(ctx, "initial state"); err != nil {
+		t.Fatalf("initial commit failed: %v", err)
+	}
+
+	t.Run("returns false when nothing to commit", func(t *testing.T) {
+		committed, err := store.CommitPending(ctx, "test-actor")
 		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
+			t.Fatalf("CommitPending failed: %v", err)
 		}
-		if !result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=true for empty commit")
+		if committed {
+			t.Error("expected false when no changes pending")
 		}
 	})
 
-	t.Run("invalid commit returns needsFullExport", func(t *testing.T) {
-		result, err := store.GetChangesSinceExport(ctx, "nonexistent123456789012345678901234567890")
+	t.Run("commits accumulated changes with summary", func(t *testing.T) {
+		headBefore, err := store.GetCurrentCommit(ctx)
 		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
+			t.Fatalf("failed to get HEAD: %v", err)
 		}
-		if !result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=true for invalid commit")
+
+		// Insert directly via SQL to leave changes uncommitted in Dolt working set.
+		// (CreateIssue auto-commits via DOLT_COMMIT, so it can't be used here.)
+		_, err = store.db.ExecContext(ctx,
+			`INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, created_at, updated_at)
+			 VALUES ('batch-test-1', 'Batch test issue', '', '', '', '', 'open', 2, 'task', NOW(), NOW())`)
+		if err != nil {
+			t.Fatalf("raw INSERT failed: %v", err)
+		}
+
+		// Now commit pending changes
+		committed, err := store.CommitPending(ctx, "test-actor")
+		if err != nil {
+			t.Fatalf("CommitPending failed: %v", err)
+		}
+		if !committed {
+			t.Error("expected true when changes were pending")
+		}
+
+		headAfter, err := store.GetCurrentCommit(ctx)
+		if err != nil {
+			t.Fatalf("failed to get HEAD after commit: %v", err)
+		}
+		if headAfter == headBefore {
+			t.Error("expected HEAD to advance after CommitPending")
 		}
 	})
 
-	t.Run("malformed commit returns needsFullExport", func(t *testing.T) {
-		result, err := store.GetChangesSinceExport(ctx, "invalid'hash")
+	t.Run("generates descriptive message", func(t *testing.T) {
+		// Insert directly via SQL to leave changes uncommitted in Dolt working set.
+		// (CreateIssue auto-commits via DOLT_COMMIT, so it can't be used here.)
+		_, err := store.db.ExecContext(ctx,
+			`INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, created_at, updated_at)
+			 VALUES ('msg-test-1', 'Message test issue', '', '', '', '', 'open', 2, 'task', NOW(), NOW())`)
 		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
+			t.Fatalf("raw INSERT failed: %v", err)
 		}
-		if !result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=true for malformed commit")
+
+		// Build the message (without committing)
+		msg := store.buildBatchCommitMessage(ctx, "test-actor")
+		if !strings.Contains(msg, "batch commit") {
+			t.Errorf("expected 'batch commit' in message, got: %q", msg)
+		}
+		if !strings.Contains(msg, "test-actor") {
+			t.Errorf("expected actor in message, got: %q", msg)
+		}
+		if !strings.Contains(msg, "created") {
+			t.Errorf("expected 'created' in message for new issues, got: %q", msg)
+		}
+
+		// Clean up — commit to clear working set
+		if err := store.Commit(ctx, "cleanup"); err != nil {
+			t.Fatalf("cleanup commit failed: %v", err)
 		}
 	})
+}
 
-	t.Run("no changes returns empty entries", func(t *testing.T) {
-		// First create and commit an issue so the issues table has committed data
-		issue := &types.Issue{
-			ID:          "test-export-baseline",
-			Title:       "Baseline Issue",
-			Description: "Ensures table exists in committed state",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
+// TestIsSafeCommitRef is a be-shbed / PR #5806 review regression test.
+// dolt_diff() accepts the literal "WORKING" as an endpoint alongside real
+// commit hashes, and the fix threads that literal through ChangedIssueIDs as
+// the incremental path's "to" endpoint (in place of a root/working-set hash
+// dolt_diff always rejected) — isSafeCommitRef's character/length check must
+// keep admitting it, since no prior test in this file covered that value.
+func TestIsSafeCommitRef(t *testing.T) {
+	valid := []string{
+		"WORKING",
+		"a",
+		"0123456789abcdefABCDEF",
+		strings.Repeat("a", 64),
+	}
+	for _, s := range valid {
+		if !isSafeCommitRef(s) {
+			t.Errorf("isSafeCommitRef(%q) = false, want true", s)
 		}
-		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-			t.Fatalf("failed to create baseline issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Add baseline issue"); err != nil {
-			t.Fatalf("failed to commit baseline: %v", err)
-		}
+	}
 
-		// Get current commit
-		currentCommit, err := store.GetCurrentCommit(ctx)
-		if err != nil {
-			t.Fatalf("failed to get current commit: %v", err)
+	invalid := []string{
+		"",
+		strings.Repeat("a", 65),
+		"has space",
+		"has-dash",
+		"has_underscore",
+		"has.dot",
+		"'; DROP TABLE issues; --",
+		"abc\ndef",
+	}
+	for _, s := range invalid {
+		if isSafeCommitRef(s) {
+			t.Errorf("isSafeCommitRef(%q) = true, want false", s)
 		}
-
-		// Query changes since current commit (should be none)
-		result, err := store.GetChangesSinceExport(ctx, currentCommit)
-		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-		if result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=false for valid commit")
-		}
-		if len(result.Entries) != 0 {
-			t.Errorf("expected 0 entries, got %d", len(result.Entries))
-		}
-	})
-
-	t.Run("create issue shows added in diff", func(t *testing.T) {
-		// Get commit before creating issue
-		beforeCommit, err := store.GetCurrentCommit(ctx)
-		if err != nil {
-			t.Fatalf("failed to get current commit: %v", err)
-		}
-
-		// Create an issue
-		issue := &types.Issue{
-			ID:          "test-export-add",
-			Title:       "Test Export Add",
-			Description: "Testing added detection",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-			t.Fatalf("failed to create issue: %v", err)
-		}
-
-		// Commit the changes
-		if err := store.Commit(ctx, "Add test issue"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get changes since before
-		result, err := store.GetChangesSinceExport(ctx, beforeCommit)
-		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-
-		if result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=false")
-		}
-
-		// Find the added entry
-		var foundAdded bool
-		for _, entry := range result.Entries {
-			if entry.IssueID == issue.ID && entry.DiffType == "added" {
-				foundAdded = true
-				if entry.NewValue == nil {
-					t.Error("expected NewValue to be set for added entry")
-				}
-				break
-			}
-		}
-		if !foundAdded {
-			t.Errorf("expected to find 'added' entry for issue %s", issue.ID)
-		}
-	})
-
-	t.Run("update issue shows modified in diff", func(t *testing.T) {
-		// Create an issue first
-		issue := &types.Issue{
-			ID:          "test-export-modify",
-			Title:       "Test Export Modify",
-			Description: "Testing modified detection",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-			t.Fatalf("failed to create issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Add issue for modify test"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get commit before updating
-		beforeCommit, err := store.GetCurrentCommit(ctx)
-		if err != nil {
-			t.Fatalf("failed to get current commit: %v", err)
-		}
-
-		// Update the issue
-		updates := map[string]interface{}{
-			"title": "Updated Title",
-		}
-		if err := store.UpdateIssue(ctx, issue.ID, updates, "tester"); err != nil {
-			t.Fatalf("failed to update issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Update test issue"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get changes since before
-		result, err := store.GetChangesSinceExport(ctx, beforeCommit)
-		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-
-		if result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=false")
-		}
-
-		// Find the modified entry
-		var foundModified bool
-		for _, entry := range result.Entries {
-			if entry.IssueID == issue.ID && entry.DiffType == "modified" {
-				foundModified = true
-				if entry.OldValue == nil || entry.NewValue == nil {
-					t.Error("expected both OldValue and NewValue to be set for modified entry")
-				}
-				break
-			}
-		}
-		if !foundModified {
-			t.Errorf("expected to find 'modified' entry for issue %s", issue.ID)
-		}
-	})
-
-	t.Run("delete issue shows removed in diff", func(t *testing.T) {
-		// Create an issue first
-		issue := &types.Issue{
-			ID:          "test-export-delete",
-			Title:       "Test Export Delete",
-			Description: "Testing removed detection",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-			t.Fatalf("failed to create issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Add issue for delete test"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get commit before deleting
-		beforeCommit, err := store.GetCurrentCommit(ctx)
-		if err != nil {
-			t.Fatalf("failed to get current commit: %v", err)
-		}
-
-		// Delete the issue
-		if err := store.DeleteIssue(ctx, issue.ID); err != nil {
-			t.Fatalf("failed to delete issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Delete test issue"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get changes since before
-		result, err := store.GetChangesSinceExport(ctx, beforeCommit)
-		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-
-		if result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=false")
-		}
-
-		// Find the removed entry
-		var foundRemoved bool
-		for _, entry := range result.Entries {
-			if entry.IssueID == issue.ID && entry.DiffType == "removed" {
-				foundRemoved = true
-				if entry.OldValue == nil {
-					t.Error("expected OldValue to be set for removed entry")
-				}
-				break
-			}
-		}
-		if !foundRemoved {
-			t.Errorf("expected to find 'removed' entry for issue %s", issue.ID)
-		}
-	})
+	}
 }

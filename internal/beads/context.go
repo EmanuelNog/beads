@@ -15,20 +15,40 @@
 //	}
 //	cmd := rc.GitCmd(ctx, "status")  // Runs in beads repo, not CWD
 //
-// See docs/REPO_CONTEXT.md for detailed documentation.
+// See engdocs/REPO_CONTEXT.md for detailed documentation.
 package beads
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/steveyegge/beads/internal/git"
 )
+
+// UserRole represents the user's relationship to a repository.
+// Used to determine appropriate behaviors for fork contributors vs maintainers.
+type UserRole string
+
+// Role constants for user relationship to repository.
+const (
+	// Contributor indicates the user is contributing to a fork (not the maintainer).
+	// BEADS_DIR redirection implies contributor role automatically.
+	Contributor UserRole = "contributor"
+
+	// Maintainer indicates the user owns/maintains the repository.
+	Maintainer UserRole = "maintainer"
+)
+
+// ErrRoleNotConfigured is returned when beads.role is not set in git config.
+// This signals that the init prompt should be shown to configure the role.
+var ErrRoleNotConfigured = errors.New("beads.role not configured in git config")
 
 // RepoContext holds resolved repository paths for beads operations.
 //
@@ -50,8 +70,8 @@ type RepoContext struct {
 	// May differ from RepoRoot when BEADS_DIR points elsewhere.
 	CWDRepoRoot string
 
-	// IsRedirected is true if BeadsDir was resolved via BEADS_DIR env var
-	// pointing to a different repository than CWD.
+	// IsRedirected is true if BeadsDir resolves to a different repository than CWD.
+	// This covers explicit BEADS_DIR usage and redirect files.
 	IsRedirected bool
 
 	// IsWorktree is true if CWD is in a git worktree.
@@ -93,14 +113,21 @@ func buildRepoContext() (*RepoContext, error) {
 		return nil, fmt.Errorf("BEADS_DIR points to unsafe location: %s", beadsDir)
 	}
 
-	// 3. Check for redirect
+	// 3. Check for redirect file in the local repo
 	redirectInfo := GetRedirectInfo()
 
-	// 3. Determine RepoRoot based on redirect status
+	// 4. Determine RepoRoot based on external/redirect status
 	var repoRoot string
-	if redirectInfo.IsRedirected {
-		// BEADS_DIR points to different repo - use that repo's root
-		repoRoot = filepath.Dir(beadsDir)
+	isExternal := redirectInfo.IsRedirected
+	if !isExternal {
+		if external, err := isExternalBeadsDir(beadsDir); err == nil {
+			isExternal = external
+		}
+	}
+
+	if isExternal {
+		// Beads dir is in a different repo - use that repo's root
+		repoRoot = repoRootForBeadsDir(beadsDir)
 	} else {
 		// Normal case - find repo root via git
 		var err error
@@ -110,19 +137,81 @@ func buildRepoContext() (*RepoContext, error) {
 		}
 	}
 
-	// 4. Get CWD's repo root (may differ from RepoRoot)
+	// 5. Get CWD's repo root (may differ from RepoRoot)
 	cwdRepoRoot := git.GetRepoRoot() // Returns "" if not in git repo
 
-	// 5. Check worktree status
+	// 6. Check worktree status
 	isWorktree := git.IsWorktree()
 
 	return &RepoContext{
 		BeadsDir:     beadsDir,
 		RepoRoot:     repoRoot,
 		CWDRepoRoot:  cwdRepoRoot,
-		IsRedirected: redirectInfo.IsRedirected,
+		IsRedirected: isExternal,
 		IsWorktree:   isWorktree,
 	}, nil
+}
+
+// isExternalBeadsDir returns true if beadsDir is in a different git repo than CWD.
+// Uses git common dir to correctly handle worktrees and bare repos.
+func isExternalBeadsDir(beadsDir string) (bool, error) {
+	cwdCommonDir, err := git.GetGitCommonDir()
+	if err != nil {
+		return false, err
+	}
+
+	beadsCommonDir, err := getGitCommonDirForPath(beadsDir)
+	if err != nil {
+		return false, err
+	}
+
+	return cwdCommonDir != beadsCommonDir, nil
+}
+
+// getGitCommonDirForPath returns the shared git directory for a path.
+// For worktrees, this returns the shared git directory (common to all worktrees).
+func getGitCommonDirForPath(path string) (string, error) {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--git-common-dir")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get git common dir for %s: %w", path, err)
+	}
+	result := strings.TrimSpace(string(output))
+
+	if !filepath.IsAbs(result) {
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return "", fmt.Errorf("failed to get absolute path for %s: %w", path, err)
+		}
+		result = filepath.Join(absPath, result)
+	}
+
+	result = filepath.Clean(result)
+	if resolved, err := filepath.EvalSymlinks(result); err == nil {
+		result = resolved
+	}
+
+	return result, nil
+}
+
+// repoRootForBeadsDir returns the repository root for a beads directory.
+// Falls back to the beadsDir parent if git lookup fails.
+func repoRootForBeadsDir(beadsDir string) string {
+	repoRoot, err := getRepoRootFromPath(beadsDir)
+	if err == nil && repoRoot != "" {
+		return repoRoot
+	}
+	return filepath.Dir(beadsDir)
+}
+
+// getRepoRootFromPath returns the git repository root for a given path.
+func getRepoRootFromPath(path string) (string, error) {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--show-toplevel")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get git root for %s: %w", path, err)
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 // GitCmd creates an exec.Cmd configured to run git in the beads repository.
@@ -139,14 +228,26 @@ func buildRepoContext() (*RepoContext, error) {
 //	output, err := cmd.Output()
 //
 // Equivalent to running: cd $RepoRoot && git add .beads/
+//
+// GH#2538: When running from a git worktree, git may inherit environment
+// variables that point to the worktree's .git instead of the main repo.
+// We explicitly set GIT_DIR and GIT_WORK_TREE to ensure git operates on
+// the correct repository (the one containing .beads/).
 func (rc *RepoContext) GitCmd(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	gitArgs := append([]string{"-c", "core.hooksPath="}, args...)
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
 	cmd.Dir = rc.RepoRoot
+
+	// GH#2538: Ensure git uses the target repository, not the worktree we may be running from.
+	// This fixes "pathspec outside repository" errors when bd sync runs from a worktree.
+	gitDir := filepath.Join(rc.RepoRoot, ".git")
+
 	// Security: Disable git hooks and templates to prevent code execution
 	// in potentially malicious repositories (SEC-001, SEC-002)
 	cmd.Env = append(os.Environ(),
-		"GIT_HOOKS_PATH=",   // Disable hooks
-		"GIT_TEMPLATE_DIR=", // Disable templates
+		"GIT_TEMPLATE_DIR=",          // Disable templates
+		"GIT_DIR="+gitDir,            // Ensure git uses the correct .git directory
+		"GIT_WORK_TREE="+rc.RepoRoot, // Ensure git uses the correct work tree
 	)
 	return cmd
 }
@@ -208,17 +309,40 @@ func isPathInSafeBoundary(path string) bool {
 		return false
 	}
 
-	// Allow OS-designated temp directories (e.g., /var/folders on macOS)
-	// On macOS, TempDir() returns paths under /var/folders which symlinks to /private/var/folders
-	tempDir := os.TempDir()
-	resolvedTemp, _ := filepath.EvalSymlinks(tempDir)
-	resolvedPath, _ := filepath.EvalSymlinks(absPath)
-	if resolvedTemp != "" && strings.HasPrefix(resolvedPath, resolvedTemp) {
+	// Allow OS-designated temp directories (e.g., /var/folders on macOS, which
+	// symlinks to /private/var/folders). World-writable, so resolve symlinks
+	// before admitting: a symlink planted under the temp dir whose target
+	// escapes the boundary must be rejected, not followed into a system
+	// directory — same treatment as the /Users/Shared carve-out below
+	// (be-kghzr SEC-003 hardening).
+	// The carve-out must admit both spellings of the temp root: os.TempDir()
+	// itself (on macOS the symlinked /var/folders/... form) and its physical
+	// resolution (/private/var/folders/...). A caller-supplied path that has
+	// already been symlink-resolved arrives in the physical form and would
+	// otherwise skip this branch and be rejected by the /private deny prefix
+	// below.
+	tempDir := strings.TrimSuffix(os.TempDir(), "/")
+	physTempDir := strings.TrimSuffix(resolveLongestExistingAncestor(tempDir), "/")
+	if absPath == tempDir || strings.HasPrefix(absPath, tempDir+"/") ||
+		absPath == physTempDir || strings.HasPrefix(absPath, physTempDir+"/") {
+		return resolvedPathWithinRoot(absPath, tempDir)
+	}
+
+	// Allow /var/home as a valid user home directory (Fedora Silverblue, Bluefin, etc.)
+	if strings.HasPrefix(absPath, "/var/home/") {
 		return true
 	}
-	// Also check unresolved paths (in case symlink resolution fails)
-	if strings.HasPrefix(absPath, tempDir) {
-		return true
+
+	// Allow /var/tmp as the FHS-standard secondary temp directory (persists across
+	// reboots, unlike /tmp). This is distinct from the os.TempDir() carve-out
+	// above: a machine's build tooling can set GOTMPDIR to redirect Go's own
+	// test/compile temp dirs under /var/tmp even while os.TempDir() itself still
+	// reports /tmp, so t.TempDir() in a test binary can land here without the
+	// os.TempDir() check ever seeing it (be-odye4). Like /Users/Shared, /var/tmp is
+	// world-writable (drwxrwxrwt), so resolve symlinks before admitting (SEC-003):
+	// a symlink planted under it must not be followed into a rejected directory.
+	if absPath == "/var/tmp" || strings.HasPrefix(absPath, "/var/tmp/") {
+		return resolvedPathWithinRoot(absPath, "/var/tmp")
 	}
 
 	for _, prefix := range unsafePrefixes {
@@ -226,25 +350,98 @@ func isPathInSafeBoundary(path string) bool {
 			return false
 		}
 	}
-	// Also reject other users' home directories
-	homeDir, _ := os.UserHomeDir()
-	if strings.HasPrefix(absPath, "/Users/") || strings.HasPrefix(absPath, "/home/") {
-		if homeDir != "" && !strings.HasPrefix(absPath, homeDir) {
-			return false
+	// macOS's /Users/Shared is the OS-designated shared directory, not a peer
+	// user's home — allow it (and its subpaths) before the peer-home rejection
+	// below. SEC-003 guards against path traversal into system directories; the
+	// unsafePrefixes blocklist above stays authoritative, so this carve-out only
+	// admits the shared dir, mirroring the /var/home/ allowance. /Users/Shared is
+	// world-writable (drwxrwxrwt), so resolve symlinks before admitting: a symlink
+	// planted under it whose target escapes the boundary must be rejected, not
+	// followed into a system directory (be-vc1 SEC-003 hardening).
+	if absPath == "/Users/Shared" || strings.HasPrefix(absPath, "/Users/Shared/") {
+		return resolvedPathWithinRoot(absPath, "/Users/Shared")
+	}
+
+	// Also reject other users' home directories.
+	if strings.HasPrefix(absPath, "/Users/") || strings.HasPrefix(absPath, "/home/") || strings.HasPrefix(absPath, "/var/home/") {
+		// Resolve the current user's home from the account database, which is
+		// not affected by $HOME manipulation. Fall back to $HOME when that
+		// lookup is unavailable (e.g. CGO-free builds where the user is not in
+		// /etc/passwd); leaving homeDir empty here would skip the check and
+		// fail open, which is worse than trusting $HOME.
+		homeDir := ""
+		if u, err := user.Current(); err == nil {
+			homeDir = u.HomeDir
+		}
+		if homeDir == "" {
+			homeDir, _ = os.UserHomeDir()
+		}
+		if homeDir != "" {
+			home := strings.TrimSuffix(homeDir, "/")
+			// Compare on a path boundary so a sibling like /home/aliceXX is
+			// not treated as inside /home/alice.
+			if absPath != home && !strings.HasPrefix(absPath, home+"/") {
+				return false
+			}
 		}
 	}
 	return true
 }
 
+// resolveLongestExistingAncestor canonicalizes path by resolving symlinks on its
+// longest existing ancestor and re-appending the trailing segments that do not
+// exist yet. Unlike a bare filepath.EvalSymlinks (which fails on a non-existent
+// path and leaves it unresolved), this lets a not-yet-created BEADS_DIR still be
+// canonicalized against a real, symlink-free root. The upward walk mirrors the
+// filepath.Dir loops elsewhere in this package.
+func resolveLongestExistingAncestor(path string) string {
+	cur := filepath.Clean(path)
+	remainder := ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			if remainder == "" {
+				return resolved
+			}
+			return filepath.Join(resolved, remainder)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached the filesystem root without resolving anything; return the
+			// cleaned input unchanged (best effort).
+			return filepath.Clean(path)
+		}
+		remainder = filepath.Join(filepath.Base(cur), remainder)
+		cur = parent
+	}
+}
+
+// resolvedPathWithinRoot reports whether absPath, after symlink resolution, still
+// lies within root. Both sides are resolved via resolveLongestExistingAncestor so
+// the comparison is symlink-safe and works for not-yet-created paths: a symlink
+// under root whose target escapes root resolves outside and returns false, while
+// a real (or not-yet-created) subpath of a non-symlinked root returns true.
+//
+// This hardens the /Users/Shared carve-out (be-vc1, SEC-003): /Users/Shared is
+// world-writable, so a co-located user could plant a symlink there pointing at a
+// system directory; matching on the unresolved path would admit it. Resolving
+// first closes that path-traversal vector. Resolving root too is a no-op for the
+// real /Users/Shared but is required for temp-dir-rooted tests on macOS, where
+// the temp dir lives under the symlinked /var.
+func resolvedPathWithinRoot(absPath, root string) bool {
+	resolved := resolveLongestExistingAncestor(absPath)
+	resolvedRoot := resolveLongestExistingAncestor(root)
+	return resolved == resolvedRoot || strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator))
+}
+
 // GetRepoContextForWorkspace returns a fresh RepoContext for a specific workspace.
 //
 // Unlike GetRepoContext(), this function:
-//   - Does NOT cache results (daemon handles multiple workspaces)
+//   - Does NOT cache results (caller may handle multiple workspaces)
 //   - Does NOT respect BEADS_DIR (workspace path is explicit)
 //   - Resolves worktree relationships correctly
 //
-// This is designed for long-running processes like the daemon that need to handle
-// multiple workspaces or detect context changes (DMN-001).
+// This is designed for processes that need to handle
+// multiple workspaces or detect context changes.
 //
 // The function temporarily changes to the workspace directory to resolve paths,
 // then restores the original directory.
@@ -275,7 +472,7 @@ func GetRepoContextForWorkspace(workspacePath string) (*RepoContext, error) {
 
 // buildRepoContextForWorkspace constructs RepoContext for a specific workspace.
 // Unlike buildRepoContext(), this ignores BEADS_DIR env var since the workspace
-// path is explicitly provided (used by daemon).
+// path is explicitly provided.
 func buildRepoContextForWorkspace(workspacePath string) (*RepoContext, error) {
 	// 1. Determine if we're in a worktree and find the main repo root
 	var repoRoot string
@@ -339,6 +536,76 @@ func (rc *RepoContext) Validate() error {
 	}
 	if _, err := os.Stat(rc.RepoRoot); os.IsNotExist(err) {
 		return fmt.Errorf("RepoRoot no longer exists: %s", rc.RepoRoot)
+	}
+	return nil
+}
+
+// GitOutput runs a git command in the beads repository and returns its output.
+//
+// This is a convenience wrapper around GitCmd that captures stdout.
+// Returns an error if the command fails or produces no output.
+//
+// Pattern:
+//
+//	output, err := rc.GitOutput(ctx, "config", "--get", "beads.role")
+//	if err != nil {
+//	    // Config key not set or git error
+//	}
+func (rc *RepoContext) GitOutput(ctx context.Context, args ...string) (string, error) {
+	cmd := rc.GitCmd(ctx, args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+// Role reads beads.role from git config (fresh each call, ~1ms).
+//
+// If BEADS_DIR is set (IsRedirected), returns Contributor implicitly
+// because external repo mode always indicates a contributor workflow.
+//
+// Returns ("", false) if role is not configured and not redirected.
+// The bool return indicates whether a role was determined.
+func (rc *RepoContext) Role() (UserRole, bool) {
+	// BEADS_DIR implies contributor (external repo mode)
+	if rc.IsRedirected {
+		return Contributor, true
+	}
+
+	output, err := rc.GitOutput(context.Background(), "config", "--get", "beads.role")
+	if err != nil {
+		return "", false // Not configured
+	}
+	return UserRole(strings.TrimSpace(output)), true
+}
+
+// IsContributor returns true if user is configured as contributor.
+//
+// This includes both explicit configuration (git config beads.role contributor)
+// and implicit detection (BEADS_DIR redirect active).
+func (rc *RepoContext) IsContributor() bool {
+	role, ok := rc.Role()
+	return ok && role == Contributor
+}
+
+// IsMaintainer returns true if user is configured as maintainer.
+//
+// Only returns true for explicit configuration (git config beads.role maintainer).
+// BEADS_DIR redirect always implies contributor, never maintainer.
+func (rc *RepoContext) IsMaintainer() bool {
+	role, ok := rc.Role()
+	return ok && role == Maintainer
+}
+
+// RequireRole returns error if role not configured (forces init prompt).
+//
+// Use this at command entry points that need role-aware behavior.
+// If BEADS_DIR is set, role is implicitly determined (contributor),
+// so this will not return an error.
+func (rc *RepoContext) RequireRole() error {
+	if _, ok := rc.Role(); !ok {
+		return ErrRoleNotConfigured
 	}
 	return nil
 }

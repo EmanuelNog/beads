@@ -1,502 +1,272 @@
-//go:build cgo
-
 package dolt
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/githooksenv"
 )
 
-func TestBootstrapFromJSONL(t *testing.T) {
-	// Create temp directory structure
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create beads dir: %v", err)
-	}
+// The bootstrap clone does not route through prepareDoltCLITransferCommand;
+// its env needs the git-trace scrub and the no-hooks override itself.
+func TestBootstrapCloneCmdEnvIsGuarded(t *testing.T) {
+	t.Setenv("GIT_TRACE", "1")
+	t.Setenv("GIT_CURL_VERBOSE", "1")
 
-	// Create test JSONL file with issues
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	issues := []types.Issue{
-		{
-			ID:          "test-001",
-			Title:       "First issue",
-			Description: "Test description 1",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-			CreatedAt:   time.Now().Add(-time.Hour),
-			UpdatedAt:   time.Now(),
-		},
-		{
-			ID:          "test-002",
-			Title:       "Second issue",
-			Description: "Test description 2",
-			Status:      types.StatusInProgress,
-			Priority:    1,
-			IssueType:   types.TypeBug,
-			CreatedAt:   time.Now().Add(-2 * time.Hour),
-			UpdatedAt:   time.Now().Add(-30 * time.Minute),
-			Labels:      []string{"urgent", "backend"},
-		},
-		{
-			ID:          "test-003",
-			Title:       "Closed issue",
-			Status:      types.StatusClosed,
-			Priority:    3,
-			IssueType:   types.TypeTask,
-		},
+	cmd := bootstrapCloneCmd(context.Background(), "git+https://example.com/repo.git", filepath.Join(t.TempDir(), "beads"))
+	if cmd.Env == nil {
+		t.Fatal("bootstrapCloneCmd() left cmd.Env nil; the clone would inherit stderr-directed git tracing")
 	}
-
-	var jsonlContent strings.Builder
-	for _, issue := range issues {
-		data, err := json.Marshal(issue)
-		if err != nil {
-			t.Fatalf("failed to marshal issue: %v", err)
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "GIT_TRACE=") || strings.HasPrefix(kv, "GIT_CURL_VERBOSE=") {
+			t.Errorf("bootstrapCloneCmd() kept %q; stderr-directed git tracing must be scrubbed", kv)
 		}
-		jsonlContent.Write(data)
-		jsonlContent.WriteString("\n")
 	}
-
-	if err := os.WriteFile(jsonlPath, []byte(jsonlContent.String()), 0644); err != nil {
-		t.Fatalf("failed to write JSONL: %v", err)
-	}
-
-	// Perform bootstrap
-	ctx := context.Background()
-	bootstrapped, result, err := Bootstrap(ctx, BootstrapConfig{
-		BeadsDir:    beadsDir,
-		DoltPath:    doltDir,
-		LockTimeout: 10 * time.Second,
-	})
-
-	if err != nil {
-		t.Fatalf("bootstrap failed: %v", err)
-	}
-	if !bootstrapped {
-		t.Fatal("expected bootstrap to be performed")
-	}
-	if result == nil {
-		t.Fatal("expected non-nil result")
-	}
-
-	// Verify results
-	if result.IssuesImported != 3 {
-		t.Errorf("expected 3 issues imported, got %d", result.IssuesImported)
-	}
-	if result.PrefixDetected != "test" {
-		t.Errorf("expected prefix 'test', got '%s'", result.PrefixDetected)
-	}
-
-	// Open store and verify issues were imported
-	store, err := New(ctx, &Config{Path: doltDir})
-	if err != nil {
-		t.Fatalf("failed to open store: %v", err)
-	}
-	defer store.Close()
-
-	// Check prefix was set
-	prefix, err := store.GetConfig(ctx, "issue_prefix")
-	if err != nil {
-		t.Fatalf("failed to get config: %v", err)
-	}
-	if prefix != "test" {
-		t.Errorf("expected prefix 'test', got '%s'", prefix)
-	}
-
-	// Check issues exist
-	issue1, err := store.GetIssue(ctx, "test-001")
-	if err != nil {
-		t.Fatalf("failed to get issue: %v", err)
-	}
-	if issue1 == nil {
-		t.Fatal("expected issue test-001 to exist")
-	}
-	if issue1.Title != "First issue" {
-		t.Errorf("expected title 'First issue', got '%s'", issue1.Title)
-	}
-
-	// Check labels were imported
-	issue2, err := store.GetIssue(ctx, "test-002")
-	if err != nil {
-		t.Fatalf("failed to get issue: %v", err)
-	}
-	if issue2 == nil {
-		t.Fatal("expected issue test-002 to exist")
-	}
-	if len(issue2.Labels) != 2 {
-		t.Errorf("expected 2 labels, got %d", len(issue2.Labels))
-	}
-
-	// Verify closed_at was set for closed issue
-	issue3, err := store.GetIssue(ctx, "test-003")
-	if err != nil {
-		t.Fatalf("failed to get issue: %v", err)
-	}
-	if issue3 == nil {
-		t.Fatal("expected issue test-003 to exist")
-	}
-	if issue3.ClosedAt == nil {
-		t.Error("expected closed_at to be set for closed issue")
+	if got := githooksenv.Extract(cmd.Env); !strings.Contains(got, githooksenv.NoHooksParam) {
+		t.Errorf("bootstrapCloneCmd() effective %s = %q, want the no-hooks override", githooksenv.ParametersEnv, got)
 	}
 }
 
-func TestBootstrapNoOpWhenDoltExists(t *testing.T) {
-	// Create temp directory structure with existing Dolt DB
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create beads dir: %v", err)
-	}
+// TestBootstrapFromRemoteWithDB_RejectsEmptyDatabase verifies that
+// BootstrapFromRemoteWithDB returns an error when called with an
+// empty database name. Callers should use cfg.GetDoltDatabase() which
+// applies the fallback chain (env var -> config -> default). A silent
+// fallback to "beads" here previously masked misconfiguration (GH#3029).
+func TestBootstrapFromRemoteWithDB_RejectsEmptyDatabase(t *testing.T) {
+	doltDir := t.TempDir()
 
-	// Create a Dolt store first
-	ctx := context.Background()
-	store, err := New(ctx, &Config{Path: doltDir})
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
+	_, err := BootstrapFromRemoteWithDB(context.Background(), doltDir, "file:///dev/null", "")
+	if err == nil {
+		t.Fatal("expected error for empty database name, got nil")
 	}
-	if err := store.SetConfig(ctx, "issue_prefix", "existing"); err != nil {
-		t.Fatalf("failed to set config: %v", err)
-	}
-	store.Close()
-
-	// Create JSONL file
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	issue := types.Issue{
-		ID:     "new-001",
-		Title:  "New issue",
-		Status: types.StatusOpen,
-	}
-	data, _ := json.Marshal(issue)
-	if err := os.WriteFile(jsonlPath, append(data, '\n'), 0644); err != nil {
-		t.Fatalf("failed to write JSONL: %v", err)
-	}
-
-	// Attempt bootstrap - should be no-op
-	bootstrapped, result, err := Bootstrap(ctx, BootstrapConfig{
-		BeadsDir:    beadsDir,
-		DoltPath:    doltDir,
-		LockTimeout: 10 * time.Second,
-	})
-
-	if err != nil {
-		t.Fatalf("bootstrap failed: %v", err)
-	}
-	if bootstrapped {
-		t.Error("expected no bootstrap when Dolt already exists")
-	}
-	if result != nil {
-		t.Error("expected nil result when no bootstrap performed")
-	}
-
-	// Verify original prefix preserved
-	store, err = New(ctx, &Config{Path: doltDir})
-	if err != nil {
-		t.Fatalf("failed to reopen store: %v", err)
-	}
-	defer store.Close()
-
-	prefix, _ := store.GetConfig(ctx, "issue_prefix")
-	if prefix != "existing" {
-		t.Errorf("expected prefix 'existing', got '%s'", prefix)
+	if !strings.Contains(err.Error(), "invalid database name") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
-func TestBootstrapNoOpWhenNoJSONL(t *testing.T) {
-	// Create temp directory structure without JSONL
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create beads dir: %v", err)
-	}
+// TestBootstrapFromRemoteWithDB_RejectsWhitespaceDatabase verifies that
+// whitespace-only database names are also rejected (defense-in-depth).
+func TestBootstrapFromRemoteWithDB_RejectsWhitespaceDatabase(t *testing.T) {
+	doltDir := t.TempDir()
 
-	// Attempt bootstrap - should be no-op
-	ctx := context.Background()
-	bootstrapped, result, err := Bootstrap(ctx, BootstrapConfig{
-		BeadsDir:    beadsDir,
-		DoltPath:    doltDir,
-		LockTimeout: 10 * time.Second,
-	})
-
-	if err != nil {
-		t.Fatalf("bootstrap failed: %v", err)
+	_, err := BootstrapFromRemoteWithDB(context.Background(), doltDir, "file:///dev/null", "   ")
+	if err == nil {
+		t.Fatal("expected error for whitespace-only database name, got nil")
 	}
-	if bootstrapped {
-		t.Error("expected no bootstrap when no JSONL exists")
-	}
-	if result != nil {
-		t.Error("expected nil result when no bootstrap performed")
+	if !strings.Contains(err.Error(), "invalid database name") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
-func TestBootstrapGracefulDegradation(t *testing.T) {
-	// Create temp directory structure
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create beads dir: %v", err)
-	}
-
-	// Create JSONL with some malformed lines
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	goodIssue := types.Issue{
-		ID:     "test-001",
-		Title:  "Good issue",
-		Status: types.StatusOpen,
-	}
-	goodData, _ := json.Marshal(goodIssue)
-
-	content := string(goodData) + "\n" +
-		"{invalid json}\n" +
-		"<<<<<<< HEAD\n" + // Git conflict marker
-		string(goodData) + "\n" // Duplicate - will be skipped
-
-	if err := os.WriteFile(jsonlPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write JSONL: %v", err)
-	}
-
-	// Perform bootstrap
-	ctx := context.Background()
-	bootstrapped, result, err := Bootstrap(ctx, BootstrapConfig{
-		BeadsDir:    beadsDir,
-		DoltPath:    doltDir,
-		LockTimeout: 10 * time.Second,
-	})
-
-	if err != nil {
-		t.Fatalf("bootstrap failed: %v", err)
-	}
-	if !bootstrapped {
-		t.Fatal("expected bootstrap to be performed")
-	}
-
-	// Should have parse errors for malformed lines
-	if len(result.ParseErrors) != 2 {
-		t.Errorf("expected 2 parse errors, got %d", len(result.ParseErrors))
-	}
-
-	// Should have imported the good issue
-	if result.IssuesImported != 1 {
-		t.Errorf("expected 1 issue imported, got %d", result.IssuesImported)
-	}
-
-	// Duplicate should be skipped (not errored)
-	if result.IssuesSkipped != 1 {
-		t.Errorf("expected 1 issue skipped, got %d", result.IssuesSkipped)
+// TestBootstrapFromRemoteWithDB_RejectsPathLikeDatabase verifies that
+// database names containing path separators or traversal segments are
+// rejected before a clone is attempted. Such names would let the pre-clone
+// doltExists() existence check miss a database that was already cloned
+// under a different-looking path, which previously allowed the
+// failed-clone cleanup to RemoveAll a pre-existing Dolt repo
+// (P1 data-loss finding, cross-vendor review 2026-07-07).
+func TestBootstrapFromRemoteWithDB_RejectsPathLikeDatabase(t *testing.T) {
+	for _, name := range []string{"foo/bar", "../other-db", "foo\\bar"} {
+		doltDir := t.TempDir()
+		_, err := BootstrapFromRemoteWithDB(context.Background(), doltDir, "file:///dev/null", name)
+		if err == nil {
+			t.Fatalf("expected error for path-like database name %q, got nil", name)
+		}
+		if !strings.Contains(err.Error(), "invalid database name") {
+			t.Errorf("database name %q: unexpected error message: %v", name, err)
+		}
 	}
 }
 
-func TestParseJSONLWithErrors(t *testing.T) {
-	// Create temp file with mixed content
-	tmpDir := t.TempDir()
-	jsonlPath := filepath.Join(tmpDir, "test.jsonl")
+// TestBootstrapFromRemote_UsesDefaultDatabase verifies that the
+// convenience wrapper BootstrapFromRemote explicitly passes the
+// default database name rather than an empty string.
+func TestBootstrapFromRemote_UsesDefaultDatabase(t *testing.T) {
+	// Create a doltDir that already contains a database so the function
+	// returns early (skips clone) without needing the dolt CLI.
+	doltDir := t.TempDir()
 
-	goodIssue := types.Issue{
-		ID:     "test-001",
-		Title:  "Good issue",
-		Status: types.StatusOpen,
+	// BootstrapFromRemote should not error with "invalid database name"
+	// because it passes configfile.DefaultDoltDatabase explicitly.
+	// It will return false (skipped) because doltExists returns false for an
+	// empty dir, then it will fail trying to run dolt clone — but the error
+	// should be about dolt CLI, not about an invalid database name.
+	_, err := BootstrapFromRemote(context.Background(), doltDir, "file:///dev/null")
+	if err != nil && strings.Contains(err.Error(), "invalid database name") {
+		t.Fatal("BootstrapFromRemote should pass an explicit, valid database name")
 	}
-	goodData, _ := json.Marshal(goodIssue)
+	// Any other error (dolt CLI not found, clone failure) is fine — we only care
+	// that the empty-database guard didn't fire.
+}
 
-	content := string(goodData) + "\n" +
-		"\n" + // Empty line - should be skipped
-		"   \n" + // Whitespace line - should be skipped
-		"{broken\n" + // Invalid JSON
-		"<<<<<<< HEAD\n" + // Git conflict
-		"=======\n" + // Git conflict
-		">>>>>>> branch\n" + // Git conflict
-		string(goodData) + "\n" // Another good line
+// TestBootstrapFromGitRemoteWithDB_DeprecatedWrapper verifies that the
+// deprecated BootstrapFromGitRemoteWithDB wrapper delegates correctly.
+func TestBootstrapFromGitRemoteWithDB_DeprecatedWrapper(t *testing.T) {
+	doltDir := t.TempDir()
 
-	if err := os.WriteFile(jsonlPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write file: %v", err)
+	_, err := BootstrapFromGitRemoteWithDB(context.Background(), doltDir, "file:///dev/null", "")
+	if err == nil {
+		t.Fatal("expected error for empty database name, got nil")
 	}
-
-	issues, errors := parseJSONLWithErrors(jsonlPath)
-
-	if len(issues) != 2 {
-		t.Errorf("expected 2 issues, got %d", len(issues))
-	}
-
-	// Should have 4 parse errors: 1 invalid JSON + 3 conflict markers
-	if len(errors) != 4 {
-		t.Errorf("expected 4 parse errors, got %d: %+v", len(errors), errors)
+	if !strings.Contains(err.Error(), "invalid database name") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
-func TestDetectPrefixFromIssues(t *testing.T) {
-	issues := []*types.Issue{
-		{ID: "proj-001"},
-		{ID: "proj-002"},
-		{ID: "proj-003"},
-		{ID: "other-001"},
+// TestBootstrapFromRemoteWithDB_PreservesPreExistingCloneTarget verifies
+// that a failed clone never runs cleanup on a clone target that already
+// existed before this bootstrap attempt started. This is the defense in
+// depth requested alongside database-name validation for the P1 data-loss
+// finding (cross-vendor review 2026-07-07): a target directory not created
+// by this attempt must be left untouched, even if `dolt clone` fails
+// because the target already exists.
+func TestBootstrapFromRemoteWithDB_PreservesPreExistingCloneTarget(t *testing.T) {
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt CLI not available")
 	}
 
-	prefix := detectPrefixFromIssues(issues)
-	if prefix != "proj" {
-		t.Errorf("expected prefix 'proj', got '%s'", prefix)
+	doltDir := t.TempDir()
+	cloneTarget := filepath.Join(doltDir, "beads")
+	if err := os.MkdirAll(cloneTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(cloneTarget, "README.txt")
+	if err := os.WriteFile(marker, []byte("pre-existing content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := BootstrapFromRemoteWithDB(context.Background(), doltDir, "file:///dev/null", "beads")
+	if err == nil {
+		t.Fatal("expected error from failed clone, got nil")
+	}
+	if !strings.Contains(err.Error(), "already existed before this attempt") {
+		t.Errorf("expected error to note the pre-existing target, got: %v", err)
+	}
+	if data, statErr := os.ReadFile(marker); statErr != nil || string(data) != "pre-existing content" {
+		t.Fatalf("pre-existing clone target content was not preserved: data=%q err=%v", data, statErr)
 	}
 }
 
-func TestBootstrapWithRoutesAndInteractions(t *testing.T) {
-	// Create temp directory structure
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create beads dir: %v", err)
+func TestDoltCloneArgs(t *testing.T) {
+	t.Setenv("DOLT_REMOTE_USER", "")
+	got := doltCloneArgs("https://example.com/repo", "/tmp/clone")
+	want := []string{"clone", "https://example.com/repo", "/tmp/clone"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("doltCloneArgs() = %q, want %q", got, want)
 	}
 
-	// Create test issues JSONL
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	issue := types.Issue{
-		ID:     "test-001",
-		Title:  "Test issue",
-		Status: types.StatusOpen,
-	}
-	data, _ := json.Marshal(issue)
-	if err := os.WriteFile(jsonlPath, append(data, '\n'), 0644); err != nil {
-		t.Fatalf("failed to write issues JSONL: %v", err)
-	}
-
-	// Create test routes JSONL
-	routesPath := filepath.Join(beadsDir, "routes.jsonl")
-	routesContent := `{"prefix":"test-","path":"."}
-{"prefix":"other-","path":"other/rig"}
-`
-	if err := os.WriteFile(routesPath, []byte(routesContent), 0644); err != nil {
-		t.Fatalf("failed to write routes JSONL: %v", err)
-	}
-
-	// Create test interactions JSONL
-	interactionsPath := filepath.Join(beadsDir, "interactions.jsonl")
-	interactionsContent := `{"id":"int-001","kind":"llm_call","created_at":"2025-01-20T10:00:00Z","actor":"test-agent","model":"claude-3"}
-{"id":"int-002","kind":"tool_call","created_at":"2025-01-20T10:01:00Z","actor":"test-agent","tool_name":"bash","exit_code":0}
-`
-	if err := os.WriteFile(interactionsPath, []byte(interactionsContent), 0644); err != nil {
-		t.Fatalf("failed to write interactions JSONL: %v", err)
-	}
-
-	// Perform bootstrap
-	ctx := context.Background()
-	bootstrapped, result, err := Bootstrap(ctx, BootstrapConfig{
-		BeadsDir:    beadsDir,
-		DoltPath:    doltDir,
-		LockTimeout: 10 * time.Second,
-	})
-
-	if err != nil {
-		t.Fatalf("bootstrap failed: %v", err)
-	}
-	if !bootstrapped {
-		t.Fatal("expected bootstrap to be performed")
-	}
-	if result == nil {
-		t.Fatal("expected non-nil result")
-	}
-
-	// Verify issues imported
-	if result.IssuesImported != 1 {
-		t.Errorf("expected 1 issue imported, got %d", result.IssuesImported)
-	}
-
-	// Verify routes imported
-	if result.RoutesImported != 2 {
-		t.Errorf("expected 2 routes imported, got %d", result.RoutesImported)
-	}
-
-	// Verify interactions imported
-	if result.InteractionsImported != 2 {
-		t.Errorf("expected 2 interactions imported, got %d", result.InteractionsImported)
-	}
-
-	// Open store and verify data
-	store, err := New(ctx, &Config{Path: doltDir})
-	if err != nil {
-		t.Fatalf("failed to open store: %v", err)
-	}
-	defer store.Close()
-
-	// Verify routes table
-	var routeCount int
-	err = store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM routes").Scan(&routeCount)
-	if err != nil {
-		t.Fatalf("failed to count routes: %v", err)
-	}
-	if routeCount != 2 {
-		t.Errorf("expected 2 routes in table, got %d", routeCount)
-	}
-
-	// Verify interactions table
-	var interactionCount int
-	err = store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM interactions").Scan(&interactionCount)
-	if err != nil {
-		t.Fatalf("failed to count interactions: %v", err)
-	}
-	if interactionCount != 2 {
-		t.Errorf("expected 2 interactions in table, got %d", interactionCount)
+	t.Setenv("DOLT_REMOTE_USER", "alice")
+	got = doltCloneArgs("https://example.com/repo", "/tmp/clone")
+	want = []string{"clone", "--user", "alice", "https://example.com/repo", "/tmp/clone"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("doltCloneArgs() = %q, want %q", got, want)
 	}
 }
 
-func TestBootstrapWithoutOptionalFiles(t *testing.T) {
-	// Test that bootstrap succeeds when routes.jsonl and interactions.jsonl don't exist
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create beads dir: %v", err)
+func TestRemoveFailedCloneTargetWithRetryRemovesPartialClone(t *testing.T) {
+	oldDelays := failedCloneCleanupRetryDelays
+	failedCloneCleanupRetryDelays = []time.Duration{0}
+	t.Cleanup(func() { failedCloneCleanupRetryDelays = oldDelays })
+
+	target := filepath.Join(t.TempDir(), "beads")
+	if err := os.MkdirAll(filepath.Join(target, ".dolt", "noms"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, ".dolt", "noms", "LOCK"), []byte("lock"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	// Create only issues JSONL
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	issue := types.Issue{
-		ID:     "test-001",
-		Title:  "Test issue",
-		Status: types.StatusOpen,
-	}
-	data, _ := json.Marshal(issue)
-	if err := os.WriteFile(jsonlPath, append(data, '\n'), 0644); err != nil {
-		t.Fatalf("failed to write issues JSONL: %v", err)
-	}
-
-	// Perform bootstrap - should succeed even without routes.jsonl and interactions.jsonl
-	ctx := context.Background()
-	bootstrapped, result, err := Bootstrap(ctx, BootstrapConfig{
-		BeadsDir:    beadsDir,
-		DoltPath:    doltDir,
-		LockTimeout: 10 * time.Second,
-	})
-
+	cleaned, err := removeFailedCloneTargetWithRetry(target)
 	if err != nil {
-		t.Fatalf("bootstrap failed: %v", err)
+		t.Fatalf("removeFailedCloneTargetWithRetry() error = %v", err)
 	}
-	if !bootstrapped {
-		t.Fatal("expected bootstrap to be performed")
+	if !cleaned {
+		t.Fatal("expected cleanup to report removing a partial Dolt clone")
 	}
-	if result == nil {
-		t.Fatal("expected non-nil result")
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected failed clone target to be removed, stat err=%v", err)
+	}
+}
+
+func TestRemoveFailedCloneTargetWithRetryPreservesNonDoltTarget(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "beads")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "README.txt"), []byte("not a dolt clone"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	// Verify issues imported
-	if result.IssuesImported != 1 {
-		t.Errorf("expected 1 issue imported, got %d", result.IssuesImported)
+	cleaned, err := removeFailedCloneTargetWithRetry(target)
+	if err != nil {
+		t.Fatalf("removeFailedCloneTargetWithRetry() error = %v", err)
+	}
+	if cleaned {
+		t.Fatal("non-Dolt target should not report cleanup")
+	}
+	if _, err := os.Stat(filepath.Join(target, "README.txt")); err != nil {
+		t.Fatalf("non-Dolt target should be preserved, stat err=%v", err)
+	}
+}
+
+func TestRemoveFailedCloneTargetWithRetryPreservesDotDoltFile(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "beads")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, ".dolt"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	// Routes and interactions should be 0 (files don't exist)
-	if result.RoutesImported != 0 {
-		t.Errorf("expected 0 routes imported, got %d", result.RoutesImported)
+	cleaned, err := removeFailedCloneTargetWithRetry(target)
+	if err != nil {
+		t.Fatalf("removeFailedCloneTargetWithRetry() error = %v", err)
 	}
-	if result.InteractionsImported != 0 {
-		t.Errorf("expected 0 interactions imported, got %d", result.InteractionsImported)
+	if cleaned {
+		t.Fatal("target with non-directory .dolt marker should not report cleanup")
+	}
+	if _, err := os.Stat(filepath.Join(target, ".dolt")); err != nil {
+		t.Fatalf("non-directory .dolt marker should be preserved, stat err=%v", err)
+	}
+}
+
+func TestFormatFailedCloneTargetErrorCleanupSucceeded(t *testing.T) {
+	err := formatFailedCloneTargetError(errors.New("exit status 1"), []byte("clone failed"), `C:\tmp\beads`, true, nil)
+
+	msg := err.Error()
+	if !strings.Contains(msg, "Cleaned up failed clone target") {
+		t.Fatalf("expected cleanup success note, got:\n%s", msg)
+	}
+	if !strings.Contains(msg, "retry `bd bootstrap`") {
+		t.Fatalf("expected retry guidance, got:\n%s", msg)
+	}
+}
+
+func TestFormatFailedCloneTargetErrorNoCleanup(t *testing.T) {
+	err := formatFailedCloneTargetError(errors.New("exit status 1"), []byte("clone failed before target"), `C:\tmp\beads`, false, nil)
+
+	msg := err.Error()
+	if strings.Contains(msg, "Cleaned up failed clone target") {
+		t.Fatalf("should not claim cleanup when no cleanup ran, got:\n%s", msg)
+	}
+	if !strings.Contains(msg, "clone failed before target") {
+		t.Fatalf("expected original output, got:\n%s", msg)
+	}
+}
+
+func TestFormatFailedCloneTargetErrorCleanupFailed(t *testing.T) {
+	err := formatFailedCloneTargetError(errors.New("exit status 1"), []byte("unable to clean up failed clone"), `C:\tmp\beads`, true, errors.New("file is in use"))
+
+	msg := err.Error()
+	for _, want := range []string{"Could not clean up failed clone target", "Windows", ".dolt/noms/LOCK", "Stop stuck dolt/bd processes"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("expected %q in error, got:\n%s", want, msg)
+		}
 	}
 }

@@ -1,60 +1,35 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/storage/factory"
 )
 
+// ErrNoBeadsDatabase reports that no beads workspace could be resolved at all,
+// as distinct from a workspace whose storage failed to open. Callers that must
+// tell "nothing here" apart from "the store is broken" — `bd prime`'s memory
+// injection, for one — match on it with errors.Is rather than on the message.
+var ErrNoBeadsDatabase = errors.New("no beads database found")
+
 // ensureDirectMode makes sure the CLI is operating in direct-storage mode.
-// If the daemon is active, it is cleanly disconnected and the shared store is opened.
-func ensureDirectMode(reason string) error {
-	if getDaemonClient() != nil {
-		if err := fallbackToDirectMode(reason); err != nil {
-			return err
-		}
-		return nil
-	}
+func ensureDirectMode(_ string) error {
 	return ensureStoreActive()
-}
-
-// fallbackToDirectMode disables the daemon client and ensures a local store is ready.
-func fallbackToDirectMode(reason string) error {
-	disableDaemonForFallback(reason)
-	return ensureStoreActive()
-}
-
-// disableDaemonForFallback closes the daemon client and updates status metadata.
-func disableDaemonForFallback(reason string) {
-	if client := getDaemonClient(); client != nil {
-		_ = client.Close()
-		setDaemonClient(nil)
-	}
-
-	ds := getDaemonStatus()
-	ds.Mode = "direct"
-	ds.Connected = false
-	ds.Degraded = true
-	if reason != "" {
-		ds.Detail = reason
-	}
-	if ds.FallbackReason == FallbackNone {
-		ds.FallbackReason = FallbackDaemonUnsupported
-	}
-	setDaemonStatus(ds)
-
-	if reason != "" {
-		debug.Logf("Debug: %s\n", reason)
-	}
 }
 
 // ensureStoreActive guarantees that a storage backend is initialized and tracked.
-// Uses the factory to respect metadata.json backend configuration (SQLite, Dolt embedded, or Dolt server).
+// Uses the factory to respect metadata.json backend configuration.
 func ensureStoreActive() error {
+	return ensureStoreActiveWithContext(getRootContext())
+}
+
+func ensureStoreActiveWithContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	lockStore()
 	active := isStoreActive() && getStore() != nil
 	unlockStore()
@@ -65,32 +40,15 @@ func ensureStoreActive() error {
 	// Find the .beads directory
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		return fmt.Errorf("no beads database found.\n" +
-			"Hint: run 'bd init' to create a database in the current directory,\n" +
-			"      or use 'bd --no-db' for JSONL-only mode")
+		return fmt.Errorf("%w.\n"+
+			"Hint: run 'bd init' to create a database in the current directory", ErrNoBeadsDatabase)
 	}
 
-	// Check if this is a JSONL-only project
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	if _, err := os.Stat(jsonlPath); err == nil {
-		// JSONL exists - check if no-db mode is configured
-		if isNoDbModeConfigured(beadsDir) {
-			return fmt.Errorf("this project uses JSONL-only mode (no SQLite database).\n" +
-				"Hint: use 'bd --no-db <command>' or set 'no-db: true' in config.yaml")
-		}
-	}
-
-	// Use factory to create the appropriate backend (SQLite, Dolt embedded, or Dolt server)
-	// based on metadata.json configuration
-	store, err := factory.NewFromConfig(getRootContext(), beadsDir)
+	// Use the factory to create the appropriate backend
+	// based on metadata.json configuration and build tags
+	store, err := newDoltStoreFromConfig(ctx, beadsDir)
 	if err != nil {
-		// Check for fresh clone scenario (JSONL exists but no database)
-		if _, statErr := os.Stat(jsonlPath); statErr == nil {
-			return fmt.Errorf("found JSONL file but no database: %s\n"+
-				"Hint: run 'bd init' to create the database and import issues,\n"+
-				"      or use 'bd --no-db' for JSONL-only mode", jsonlPath)
-		}
-		return fmt.Errorf("failed to open database: %w", err)
+		return fmt.Errorf("failed to open database: %w\nHint: %s", err, diagHint())
 	}
 
 	// Update the database path for compatibility with code that expects it
@@ -102,10 +60,6 @@ func ensureStoreActive() error {
 	setStore(store)
 	setStoreActive(true)
 	unlockStore()
-
-	if isAutoImportEnabled() {
-		autoImportIfNewer()
-	}
 
 	return nil
 }

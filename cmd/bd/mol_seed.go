@@ -1,117 +1,71 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/steveyegge/beads/internal/formula"
+	"github.com/steveyegge/beads/internal/metrics"
 )
 
 var molSeedCmd = &cobra.Command{
-	Use:   "seed [formula-name]",
-	Short: "Verify formula accessibility or seed patrol formulas",
-	Long: `Verify that formulas are accessible and can be cooked.
+	Use:   "seed <formula-name>",
+	Short: "Verify formula accessibility",
+	Long: `Verify that a formula is accessible and can be cooked.
 
-The seed command checks formula search paths to ensure formulas exist
+The seed command checks formula search paths to ensure a formula exists
 and can be loaded. This is useful for verifying system health before
-patrols attempt to spawn work.
-
-WITH --patrol FLAG:
-  Verifies all three patrol formulas are accessible:
-    - mol-deacon-patrol
-    - mol-witness-patrol
-    - mol-refinery-patrol
-
-WITHOUT --patrol:
-  Verifies the specified formula is accessible.
+attempting to spawn work from a formula.
 
 Formula search paths (checked in order):
-  1. .beads/formulas/ (project level)
-  2. ~/.beads/formulas/ (user level)
-  3. $GT_ROOT/.beads/formulas/ (orchestrator level, if GT_ROOT set)
+  1. <resolved-beads-dir>/formulas/ (active project)
+  2. <checkout-root>/.beads/formulas/ (repo-local formulas)
+  3. ~/.beads/formulas/ (user level)
+  4. $GT_ROOT/.beads/formulas/ (shared workspace root, if GT_ROOT set)
 
 Examples:
-  bd mol seed --patrol                    # Verify all patrol formulas
   bd mol seed mol-feature                 # Verify specific formula
   bd mol seed mol-review --var name=test  # Verify with variable substitution`,
-	Args: cobra.MaximumNArgs(1),
-	Run:  runMolSeed,
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runMolSeed,
 }
 
-func runMolSeed(cmd *cobra.Command, args []string) {
-	patrol, _ := cmd.Flags().GetBool("patrol")
+func runMolSeed(cmd *cobra.Command, args []string) error {
+	evt := metrics.NewCommandEvent("mol-seed")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
+
 	varFlags, _ := cmd.Flags().GetStringArray("var")
 
-	// Parse variables (for formula condition filtering if needed)
 	vars := make(map[string]string)
 	for _, v := range varFlags {
 		parts := strings.SplitN(v, "=", 2)
 		if len(parts) != 2 {
-			fmt.Fprintf(os.Stderr, "Error: invalid variable format '%s', expected 'key=value'\n", v)
-			os.Exit(1)
+			return HandleErrorRespectJSON("invalid variable format '%s', expected 'key=value'", v)
 		}
 		vars[parts[0]] = parts[1]
 	}
 
-	if patrol {
-		// Verify all patrol formulas
-		if err := verifyPatrolFormulas(vars); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		if !jsonOutput {
-			fmt.Println("✓ All patrol formulas accessible")
-		} else {
-			outputJSON(map[string]interface{}{
-				"status":   "ok",
-				"formulas": []string{"mol-deacon-patrol", "mol-witness-patrol", "mol-refinery-patrol"},
-			})
-		}
-		return
-	}
-
-	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: formula name required (or use --patrol flag)\n")
-		os.Exit(1)
-	}
-
-	// Verify single formula
 	formulaName := args[0]
 	if err := verifyFormula(formulaName, vars); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return HandleErrorRespectJSON("%v", err)
 	}
 
-	if !jsonOutput {
-		fmt.Printf("✓ Formula %q accessible\n", formulaName)
-	} else {
-		outputJSON(map[string]interface{}{
+	if jsonOutput {
+		return outputJSON(map[string]interface{}{
 			"status":  "ok",
 			"formula": formulaName,
 		})
 	}
-}
-
-// verifyPatrolFormulas checks that all patrol formulas are accessible
-func verifyPatrolFormulas(vars map[string]string) error {
-	patrolFormulas := []string{
-		"mol-deacon-patrol",
-		"mol-witness-patrol",
-		"mol-refinery-patrol",
-	}
-
-	var missing []string
-	for _, formula := range patrolFormulas {
-		if err := verifyFormula(formula, vars); err != nil {
-			missing = append(missing, formula)
-		}
-	}
-
-	if len(missing) > 0 {
-		return fmt.Errorf("patrol formulas not accessible: %v", missing)
-	}
-
+	fmt.Printf("✓ Formula %q accessible\n", formulaName)
 	return nil
 }
 
@@ -124,13 +78,18 @@ func verifyFormula(formulaName string, vars map[string]string) error {
 	// 4. Formula can be cooked to subgraph
 	_, err := resolveAndCookFormulaWithVars(formulaName, nil, vars)
 	if err != nil {
+		if errors.Is(err, formula.ErrVarValidation) {
+			// Don't double-wrap: the --var values fail enum/pattern/
+			// required-empty constraints, which is a distinct condition
+			// from the formula itself being inaccessible.
+			return err
+		}
 		return fmt.Errorf("formula %q not accessible: %w", formulaName, err)
 	}
 	return nil
 }
 
 func init() {
-	molSeedCmd.Flags().Bool("patrol", false, "Verify all patrol formulas (mol-deacon-patrol, mol-witness-patrol, mol-refinery-patrol)")
 	molSeedCmd.Flags().StringArray("var", []string{}, "Variable substitution for condition filtering (key=value)")
 	molCmd.AddCommand(molSeedCmd)
 }

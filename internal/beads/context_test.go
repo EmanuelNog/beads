@@ -1,9 +1,12 @@
 package beads
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/git"
@@ -373,6 +376,29 @@ func TestIsPathInSafeBoundary(t *testing.T) {
 		// Safe paths - should be accepted
 		{"user home directory", filepath.Join(homeDir, "projects/.beads"), true},
 		{"temp directory", os.TempDir(), true},
+		// A not-yet-created BEADS_DIR under the temp dir (the common real case --
+		// the directory is created after this check passes) must still validate;
+		// resolveLongestExistingAncestor is what makes this safe despite the
+		// trailing components not existing yet (be-kghzr SEC-003 hardening).
+		{"temp directory not-yet-created subpath", filepath.Join(os.TempDir(), "be-kghzr-nonexistent-subpath", ".beads"), true},
+
+		// Another user's home directory - should be rejected regardless of $HOME
+		{"other user home /home", "/home/some-other-nonexistent-user/.beads", false},
+		{"other user home /Users", "/Users/some-other-nonexistent-user/.beads", false},
+
+		// macOS /Users/Shared is the OS-designated shared directory, not a peer
+		// user's home — it must be accepted (be-vc1 / SEC-003 carve-out).
+		{"macOS shared subdir", "/Users/Shared/portharbour/.beads", true},
+		{"macOS shared root", "/Users/Shared", true},
+
+		// /var/tmp is the FHS-standard secondary temp directory (persists across
+		// reboots, unlike /tmp) and must be accepted despite matching the /var
+		// unsafePrefixes entry above. Go's own test/build tooling can root
+		// GOTMPDIR-influenced temp dirs here even when os.TempDir() itself still
+		// reports /tmp, so the os.TempDir()-based carve-out above doesn't cover it
+		// (be-odye4).
+		{"var/tmp root", "/var/tmp", true},
+		{"var/tmp GOTMPDIR-style subdir", "/var/tmp/gotmp/TestSomething1234/001/.beads", true},
 	}
 
 	for _, tt := range tests {
@@ -382,6 +408,194 @@ func TestIsPathInSafeBoundary(t *testing.T) {
 				t.Errorf("isPathInSafeBoundary(%q) = %v, want %v", tt.path, result, tt.expected)
 			}
 		})
+	}
+}
+
+// TestResolvedPathWithinRoot exercises the symlink-escape hardening helper added
+// for be-vc1 — the HIGH finding on the /Users/Shared carve-out. The helper must:
+//
+//	(a) accept a real subdirectory under root,
+//	(b) REJECT a symlink under root whose target resolves outside root (the
+//	    TOCTOU/path-traversal vector on the world-writable /Users/Shared),
+//	(c) accept a not-yet-created subpath under a real root (a BEADS_DIR that has
+//	    not been created yet must still validate, not fail closed).
+//
+// It uses a temp-dir stand-in for root so it runs on every OS — Linux CI thereby
+// proves the escape rejection (the literal /Users/Shared symlink case is darwin-
+// only and lives in TestIsPathInSafeBoundary).
+func TestResolvedPathWithinRoot(t *testing.T) {
+	root := t.TempDir()
+
+	// (a) a real subdirectory under root stays within root.
+	realSub := filepath.Join(root, "real")
+	if err := os.MkdirAll(realSub, 0o755); err != nil {
+		t.Fatalf("mkdir realSub: %v", err)
+	}
+	if !resolvedPathWithinRoot(realSub, root) {
+		t.Errorf("resolvedPathWithinRoot(%q, %q) = false, want true (real subdir under root)", realSub, root)
+	}
+
+	// (b) a symlink under root whose target is outside root must be rejected:
+	// resolving the symlink lands outside the boundary. This is the vector the
+	// security review flagged — /Users/Shared is world-writable, so a co-located
+	// user can plant such a link.
+	outside := t.TempDir() // a distinct temp dir, genuinely outside root
+	escape := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Fatalf("symlink escape: %v", err)
+	}
+	if resolvedPathWithinRoot(escape, root) {
+		t.Errorf("resolvedPathWithinRoot(%q -> %q, %q) = true, want false (symlink escapes root)", escape, outside, root)
+	}
+
+	// (c) a not-yet-created subpath under a real root still validates: the helper
+	// resolves the longest existing ancestor and re-appends the missing tail.
+	notYet := filepath.Join(root, "notyet", ".beads")
+	if !resolvedPathWithinRoot(notYet, root) {
+		t.Errorf("resolvedPathWithinRoot(%q, %q) = false, want true (not-yet-created subpath under real root)", notYet, root)
+	}
+}
+
+// TestIsPathInSafeBoundary_SharedSymlinkEscape proves, on macOS where /Users/Shared
+// actually exists and is world-writable, that a symlink planted under it whose
+// target escapes the boundary is REJECTED through isPathInSafeBoundary — the live
+// form of the be-vc1 HIGH finding. Skipped on non-darwin and when /Users/Shared is
+// absent or not writable, so it never fails spuriously on CI runners.
+func TestIsPathInSafeBoundary_SharedSymlinkEscape(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("/Users/Shared is a macOS-specific shared directory")
+	}
+	const shared = "/Users/Shared"
+	if info, err := os.Stat(shared); err != nil || !info.IsDir() {
+		t.Skipf("%s not present as a directory: %v", shared, err)
+	}
+
+	// Plant a symlink under the world-writable /Users/Shared pointing OUTSIDE the
+	// boundary, at /etc (a system dir). Best-effort clear of any stale link from a
+	// crashed run, then register cleanup.
+	link := filepath.Join(shared, fmt.Sprintf(".be-vc1-escape-test-%d", os.Getpid()))
+	_ = os.Remove(link)
+	if err := os.Symlink("/etc", link); err != nil {
+		t.Skipf("cannot create symlink in %s (not writable?): %v", shared, err)
+	}
+	t.Cleanup(func() { _ = os.Remove(link) })
+
+	// A BEADS_DIR routed *through* the escaping symlink must be rejected: its bytes
+	// resolve into /etc, outside /Users/Shared.
+	target := filepath.Join(link, ".beads")
+	if isPathInSafeBoundary(target) {
+		t.Errorf("isPathInSafeBoundary(%q) = true, want false (path through symlink escaping /Users/Shared to /etc)", target)
+	}
+
+	// The escaping symlink itself also resolves outside the boundary.
+	if isPathInSafeBoundary(link) {
+		t.Errorf("isPathInSafeBoundary(%q) = true, want false (symlink under /Users/Shared escaping to /etc)", link)
+	}
+}
+
+// TestIsPathInSafeBoundary_VarTmpSymlinkEscape proves the /var/tmp carve-out
+// (be-odye4) applies the same symlink-safe resolution as /Users/Shared: /var/tmp
+// is world-writable (drwxrwxrwt) on Linux/BSD, so a co-located user could plant a
+// symlink under it whose target escapes to a rejected system directory. Skipped
+// when /var/tmp is absent or not writable, so it never fails spuriously.
+func TestIsPathInSafeBoundary_VarTmpSymlinkEscape(t *testing.T) {
+	const varTmp = "/var/tmp"
+	if info, err := os.Stat(varTmp); err != nil || !info.IsDir() {
+		t.Skipf("%s not present as a directory: %v", varTmp, err)
+	}
+
+	link := filepath.Join(varTmp, fmt.Sprintf(".be-odye4-escape-test-%d", os.Getpid()))
+	_ = os.Remove(link)
+	if err := os.Symlink("/etc", link); err != nil {
+		t.Skipf("cannot create symlink in %s (not writable?): %v", varTmp, err)
+	}
+	t.Cleanup(func() { _ = os.Remove(link) })
+
+	// A BEADS_DIR routed *through* the escaping symlink must be rejected: its bytes
+	// resolve into /etc, outside /var/tmp.
+	target := filepath.Join(link, ".beads")
+	if isPathInSafeBoundary(target) {
+		t.Errorf("isPathInSafeBoundary(%q) = true, want false (path through symlink escaping /var/tmp to /etc)", target)
+	}
+
+	// The escaping symlink itself also resolves outside the boundary.
+	if isPathInSafeBoundary(link) {
+		t.Errorf("isPathInSafeBoundary(%q) = true, want false (symlink under /var/tmp escaping to /etc)", link)
+	}
+}
+
+// TestIsPathInSafeBoundary_TempDirSymlinkEscape mirrors
+// TestIsPathInSafeBoundary_SharedSymlinkEscape for the os.TempDir() carve-out
+// (be-kghzr SEC-003 hardening). Unlike /Users/Shared, os.TempDir() is
+// cross-platform and always present, so this test is not OS-gated.
+func TestIsPathInSafeBoundary_TempDirSymlinkEscape(t *testing.T) {
+	tempDir := os.TempDir()
+
+	// Plant a symlink under the world-writable OS temp dir pointing OUTSIDE the
+	// boundary, at /etc (a system dir). Best-effort clear of any stale link from a
+	// crashed run, then register cleanup.
+	link := filepath.Join(tempDir, fmt.Sprintf(".be-kghzr-escape-test-%d", os.Getpid()))
+	_ = os.Remove(link)
+	if err := os.Symlink("/etc", link); err != nil {
+		t.Skipf("cannot create symlink in %s (not writable?): %v", tempDir, err)
+	}
+	t.Cleanup(func() { _ = os.Remove(link) })
+
+	// A BEADS_DIR routed *through* the escaping symlink must be rejected: its bytes
+	// resolve into /etc, outside the temp dir. The trailing ".beads" component does
+	// NOT exist, so a bare filepath.EvalSymlinks(absPath) fails on the full path --
+	// this is the exact shape that tripped the old unresolved-path fallback.
+	target := filepath.Join(link, ".beads")
+	if isPathInSafeBoundary(target) {
+		t.Errorf("isPathInSafeBoundary(%q) = true, want false (path through symlink escaping temp dir to /etc)", target)
+	}
+
+	// The escaping symlink itself also resolves outside the boundary.
+	if isPathInSafeBoundary(link) {
+		t.Errorf("isPathInSafeBoundary(%q) = true, want false (symlink under temp dir escaping to /etc)", link)
+	}
+}
+
+// TestIsPathInSafeBoundary_TempDirPhysicalForm covers the macOS shape where
+// $TMPDIR is itself a symlink (/var/folders/... -> /private/var/...): a
+// caller-supplied path that has already been symlink-resolved arrives in the
+// PHYSICAL form, does not share the unresolved os.TempDir() prefix, and must
+// still be admitted by the temp-dir carve-out. On macOS the physical form
+// falls under the denied /private prefix, so without the carve-out this test
+// fails (the exact TestContext* regression from the be-kghzr hardening); on
+// platforms whose physical temp root is not under a denied prefix the
+// assertion is satisfied either way — the macos-latest CI lane is the
+// distinguishing runner.
+func TestIsPathInSafeBoundary_TempDirPhysicalForm(t *testing.T) {
+	base := t.TempDir()
+	phys := filepath.Join(base, "phys")
+	if err := os.MkdirAll(phys, 0o755); err != nil {
+		t.Fatalf("mkdir phys: %v", err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(phys, link); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+	t.Setenv("TMPDIR", link)
+
+	// Physical form of a (not-yet-created) subpath of the temp dir: must be
+	// safe. On macOS the join base itself sits under the symlinked
+	// /var/folders, so resolve it to the true physical spelling first — the
+	// probe must match what a caller supplies after EvalSymlinks, which is
+	// exactly resolveLongestExistingAncestor(TMPDIR)'s form.
+	physResolved, err := filepath.EvalSymlinks(phys)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", phys, err)
+	}
+	target := filepath.Join(physResolved, "proj", ".beads")
+	if !isPathInSafeBoundary(target) {
+		t.Errorf("isPathInSafeBoundary(%q) = false, want true (physical form of TMPDIR subpath)", target)
+	}
+
+	// The symlinked form keeps working too.
+	linked := filepath.Join(link, "proj", ".beads")
+	if !isPathInSafeBoundary(linked) {
+		t.Errorf("isPathInSafeBoundary(%q) = false, want true (symlinked form of TMPDIR subpath)", linked)
 	}
 }
 
@@ -516,4 +730,573 @@ func resolveSymlinks(path string) string {
 		return path
 	}
 	return resolved
+}
+
+// TestRole_ExplicitConfig tests Role() when beads.role is set in git config.
+func TestRole_ExplicitConfig(t *testing.T) {
+	tests := map[string]struct {
+		configValue  string
+		expectedRole UserRole
+	}{
+		"contributor role": {configValue: "contributor", expectedRole: Contributor},
+		"maintainer role":  {configValue: "maintainer", expectedRole: Maintainer},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			if err := initGitRepo(tmpDir); err != nil {
+				t.Fatalf("failed to init git repo: %v", err)
+			}
+
+			// Create .beads directory with required files
+			beadsDir := filepath.Join(tmpDir, ".beads")
+			if err := os.MkdirAll(beadsDir, 0750); err != nil {
+				t.Fatalf("failed to create .beads: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+				t.Fatalf("failed to create beads.db: %v", err)
+			}
+
+			// Set beads.role in git config
+			cmd := exec.Command("git", "config", "beads.role", tt.configValue)
+			cmd.Dir = tmpDir
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("failed to set git config: %v", err)
+			}
+
+			t.Cleanup(func() {
+				ResetCaches()
+				git.ResetCaches()
+			})
+
+			rc, err := GetRepoContextForWorkspace(tmpDir)
+			if err != nil {
+				t.Fatalf("GetRepoContextForWorkspace failed: %v", err)
+			}
+
+			role, ok := rc.Role()
+			if !ok {
+				t.Error("Role() returned ok=false, expected ok=true")
+			}
+			if role != tt.expectedRole {
+				t.Errorf("Role() = %q, want %q", role, tt.expectedRole)
+			}
+		})
+	}
+}
+
+// TestRole_NoConfig tests Role() when beads.role is not set.
+func TestRole_NoConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := initGitRepo(tmpDir); err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	// Create .beads directory with required files (no git config set)
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	t.Cleanup(func() {
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	rc, err := GetRepoContextForWorkspace(tmpDir)
+	if err != nil {
+		t.Fatalf("GetRepoContextForWorkspace failed: %v", err)
+	}
+
+	role, ok := rc.Role()
+	if ok {
+		t.Errorf("Role() returned ok=true with role=%q, expected ok=false", role)
+	}
+	if role != "" {
+		t.Errorf("Role() = %q, want empty string", role)
+	}
+}
+
+func TestGetRepoContext_BEADS_DIR_ExternalRepo(t *testing.T) {
+	originalBeadsDir := os.Getenv("BEADS_DIR")
+	t.Cleanup(func() {
+		if originalBeadsDir != "" {
+			os.Setenv("BEADS_DIR", originalBeadsDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	tmpDir := t.TempDir()
+	sourceRepo := filepath.Join(tmpDir, "source")
+	targetRepo := filepath.Join(tmpDir, "target")
+
+	for _, repo := range []string{sourceRepo, targetRepo} {
+		if err := os.MkdirAll(repo, 0750); err != nil {
+			t.Fatalf("failed to create repo dir: %v", err)
+		}
+		if err := initGitRepo(repo); err != nil {
+			t.Fatalf("failed to init git repo: %v", err)
+		}
+	}
+
+	targetBeadsDir := filepath.Join(targetRepo, ".beads")
+	if err := os.MkdirAll(targetBeadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads in target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetBeadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	os.Setenv("BEADS_DIR", targetBeadsDir)
+
+	originalWd, _ := os.Getwd()
+	if err := os.Chdir(sourceRepo); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		os.Chdir(originalWd)
+	})
+
+	ResetCaches()
+	git.ResetCaches()
+
+	rc, err := GetRepoContext()
+	if err != nil {
+		t.Fatalf("GetRepoContext failed: %v", err)
+	}
+
+	expectedBeadsDir := resolveSymlinks(targetBeadsDir)
+	if rc.BeadsDir != expectedBeadsDir {
+		t.Errorf("BeadsDir mismatch: expected %s, got %s", expectedBeadsDir, rc.BeadsDir)
+	}
+
+	expectedRepoRoot := resolveSymlinks(targetRepo)
+	if rc.RepoRoot != expectedRepoRoot {
+		t.Errorf("RepoRoot mismatch: expected %s, got %s", expectedRepoRoot, rc.RepoRoot)
+	}
+
+	if !rc.IsRedirected {
+		t.Error("IsRedirected should be true when BEADS_DIR points to a different repo")
+	}
+}
+
+// TestRole_BEADS_DIR_ImpliesContributor tests that BEADS_DIR redirect
+// implicitly returns Contributor role without requiring git config.
+func TestRole_BEADS_DIR_ImpliesContributor(t *testing.T) {
+	// Save original env var
+	originalBeadsDir := os.Getenv("BEADS_DIR")
+	t.Cleanup(func() {
+		if originalBeadsDir != "" {
+			os.Setenv("BEADS_DIR", originalBeadsDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	// Create two repos: source repo and target repo for redirect
+	tmpDir := t.TempDir()
+	sourceRepo := filepath.Join(tmpDir, "source")
+	targetRepo := filepath.Join(tmpDir, "target")
+
+	for _, repo := range []string{sourceRepo, targetRepo} {
+		if err := os.MkdirAll(repo, 0750); err != nil {
+			t.Fatalf("failed to create repo dir: %v", err)
+		}
+		if err := initGitRepo(repo); err != nil {
+			t.Fatalf("failed to init git repo: %v", err)
+		}
+	}
+
+	// Create .beads with files in target repo
+	targetBeadsDir := filepath.Join(targetRepo, ".beads")
+	if err := os.MkdirAll(targetBeadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads in target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetBeadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	// Create .beads in source repo with redirect to target
+	sourceBeadsDir := filepath.Join(sourceRepo, ".beads")
+	if err := os.MkdirAll(sourceBeadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads in source: %v", err)
+	}
+	redirectFile := filepath.Join(sourceBeadsDir, "redirect")
+	if err := os.WriteFile(redirectFile, []byte(targetBeadsDir+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write redirect file: %v", err)
+	}
+
+	// Set BEADS_DIR to the target (simulating direnv setup)
+	os.Setenv("BEADS_DIR", targetBeadsDir)
+
+	// Change to source repo to trigger redirect detection
+	originalWd, _ := os.Getwd()
+	if err := os.Chdir(sourceRepo); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		os.Chdir(originalWd)
+	})
+
+	// Get context - should detect redirect via GetRedirectInfo
+	rc, err := GetRepoContext()
+	if err != nil {
+		t.Fatalf("GetRepoContext failed: %v", err)
+	}
+
+	// IsRedirected should be true
+	if !rc.IsRedirected {
+		t.Error("IsRedirected should be true when BEADS_DIR points elsewhere")
+	}
+
+	// Role should implicitly return Contributor
+	role, ok := rc.Role()
+	if !ok {
+		t.Error("Role() returned ok=false, expected ok=true for redirected context")
+	}
+	if role != Contributor {
+		t.Errorf("Role() = %q, want %q (implicit contributor for BEADS_DIR)", role, Contributor)
+	}
+
+	// IsContributor should return true
+	if !rc.IsContributor() {
+		t.Error("IsContributor() = false, want true for redirected context")
+	}
+
+	// IsMaintainer should return false
+	if rc.IsMaintainer() {
+		t.Error("IsMaintainer() = true, want false for redirected context")
+	}
+}
+
+// TestIsContributor tests the IsContributor convenience method.
+func TestIsContributor(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := initGitRepo(tmpDir); err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	// Set role to contributor
+	cmd := exec.Command("git", "config", "beads.role", "contributor")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to set git config: %v", err)
+	}
+
+	t.Cleanup(func() {
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	rc, err := GetRepoContextForWorkspace(tmpDir)
+	if err != nil {
+		t.Fatalf("GetRepoContextForWorkspace failed: %v", err)
+	}
+
+	if !rc.IsContributor() {
+		t.Error("IsContributor() = false, want true")
+	}
+	if rc.IsMaintainer() {
+		t.Error("IsMaintainer() = true, want false")
+	}
+}
+
+// TestIsMaintainer tests the IsMaintainer convenience method.
+func TestIsMaintainer(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := initGitRepo(tmpDir); err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	// Set role to maintainer
+	cmd := exec.Command("git", "config", "beads.role", "maintainer")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to set git config: %v", err)
+	}
+
+	t.Cleanup(func() {
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	rc, err := GetRepoContextForWorkspace(tmpDir)
+	if err != nil {
+		t.Fatalf("GetRepoContextForWorkspace failed: %v", err)
+	}
+
+	if rc.IsContributor() {
+		t.Error("IsContributor() = true, want false")
+	}
+	if !rc.IsMaintainer() {
+		t.Error("IsMaintainer() = false, want true")
+	}
+}
+
+// TestRequireRole_Configured tests RequireRole when role is set.
+func TestRequireRole_Configured(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := initGitRepo(tmpDir); err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	// Set role
+	cmd := exec.Command("git", "config", "beads.role", "contributor")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to set git config: %v", err)
+	}
+
+	t.Cleanup(func() {
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	rc, err := GetRepoContextForWorkspace(tmpDir)
+	if err != nil {
+		t.Fatalf("GetRepoContextForWorkspace failed: %v", err)
+	}
+
+	if err := rc.RequireRole(); err != nil {
+		t.Errorf("RequireRole() returned error: %v, want nil", err)
+	}
+}
+
+// TestRequireRole_NotConfigured tests RequireRole when role is not set.
+func TestRequireRole_NotConfigured(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := initGitRepo(tmpDir); err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	// Don't set any role config
+
+	t.Cleanup(func() {
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	rc, err := GetRepoContextForWorkspace(tmpDir)
+	if err != nil {
+		t.Fatalf("GetRepoContextForWorkspace failed: %v", err)
+	}
+
+	err = rc.RequireRole()
+	if err == nil {
+		t.Error("RequireRole() returned nil, want ErrRoleNotConfigured")
+	}
+	if err != ErrRoleNotConfigured {
+		t.Errorf("RequireRole() returned %v, want ErrRoleNotConfigured", err)
+	}
+}
+
+// TestGitOutput tests the GitOutput helper method.
+func TestGitOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := initGitRepo(tmpDir); err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	// Set a test config value
+	cmd := exec.Command("git", "config", "test.value", "hello-world")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to set git config: %v", err)
+	}
+
+	t.Cleanup(func() {
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	rc, err := GetRepoContextForWorkspace(tmpDir)
+	if err != nil {
+		t.Fatalf("GetRepoContextForWorkspace failed: %v", err)
+	}
+
+	// Test successful output
+	output, err := rc.GitOutput(t.Context(), "config", "--get", "test.value")
+	if err != nil {
+		t.Errorf("GitOutput() returned error: %v", err)
+	}
+	expected := "hello-world\n"
+	if output != expected {
+		t.Errorf("GitOutput() = %q, want %q", output, expected)
+	}
+
+	// Test error case (non-existent config)
+	_, err = rc.GitOutput(t.Context(), "config", "--get", "nonexistent.key")
+	if err == nil {
+		t.Error("GitOutput() returned nil error for non-existent key, want error")
+	}
+}
+
+// TestGitCmd_WorktreeContext tests that GitCmd correctly operates on the main repo
+// even when running from a git worktree context (GH#2538).
+func TestGitCmd_WorktreeContext(t *testing.T) {
+
+	t.Cleanup(func() {
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	// Create main repo with initial commit (worktrees require at least one commit)
+	mainRepo := t.TempDir()
+	if err := initGitRepoWithCommit(mainRepo); err != nil {
+		t.Fatalf("failed to init main repo: %v", err)
+	}
+
+	// Create .beads directory with required files
+	beadsDir := filepath.Join(mainRepo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads dir: %v", err)
+	}
+	testFile := filepath.Join(beadsDir, "test.jsonl")
+	if err := os.WriteFile(testFile, []byte(`{"id":"test-1"}`), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	// Create a git worktree
+	worktreeDir := filepath.Join(t.TempDir(), "worktree")
+	branchCmd := exec.Command("git", "branch", "test-worktree-branch")
+	branchCmd.Dir = mainRepo
+	if err := branchCmd.Run(); err != nil {
+		t.Fatalf("failed to create branch: %v", err)
+	}
+	wtCmd := exec.Command("git", "worktree", "add", worktreeDir, "test-worktree-branch")
+	wtCmd.Dir = mainRepo
+	output, err := wtCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to create worktree: %v\nOutput: %s", err, output)
+	}
+
+	// Save and restore working directory
+	originalWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	t.Cleanup(func() { os.Chdir(originalWd) })
+
+	// Change to worktree directory to simulate running from worktree context
+	if err := os.Chdir(worktreeDir); err != nil {
+		t.Fatalf("failed to chdir to worktree: %v", err)
+	}
+	git.ResetCaches()
+
+	// Get RepoContext - should resolve to main repo's .beads
+	rc, err := GetRepoContext()
+	if err != nil {
+		t.Fatalf("GetRepoContext failed: %v", err)
+	}
+
+	expectedBeadsDir := resolveSymlinks(beadsDir)
+	if rc.BeadsDir != expectedBeadsDir {
+		t.Errorf("BeadsDir = %q, want %q", rc.BeadsDir, expectedBeadsDir)
+	}
+
+	// GH#2538: The key test - use GitCmd to add a file in the main repo
+	// This should work even though we're "running" from the worktree
+	ctx := context.Background()
+	// Resolve symlinks on testFile (macOS /tmp -> /private/var) to match rc.RepoRoot
+	resolvedTestFile := resolveSymlinks(testFile)
+	relPath, err := filepath.Rel(rc.RepoRoot, resolvedTestFile)
+	if err != nil {
+		t.Fatalf("failed to get relative path: %v", err)
+	}
+
+	addCmd := rc.GitCmd(ctx, "add", "-f", relPath)
+	addOutput, err := addCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("GitCmd git add failed: %v\nOutput: %s", err, addOutput)
+	}
+
+	// Verify the file was staged
+	statusCmd := rc.GitCmd(ctx, "status", "--porcelain", relPath)
+	statusOutput, err := statusCmd.Output()
+	if err != nil {
+		t.Fatalf("git status failed: %v", err)
+	}
+	if string(statusOutput) == "" {
+		t.Error("file was not staged - git status shows no changes")
+	}
+}
+
+// initGitRepoWithCommit creates a git repo with an initial commit.
+func initGitRepoWithCommit(dir string) error {
+	cmds := [][]string{
+		{"git", "init"},
+		{"git", "config", "user.email", "test@test.com"},
+		{"git", "config", "user.name", "Test User"},
+	}
+	for _, args := range cmds {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("git %v failed: %w", args[1:], err)
+		}
+	}
+	readmeFile := filepath.Join(dir, "README.md")
+	if err := os.WriteFile(readmeFile, []byte("# Test Repo"), 0644); err != nil {
+		return err
+	}
+	addCmd := exec.Command("git", "add", "README.md")
+	addCmd.Dir = dir
+	if err := addCmd.Run(); err != nil {
+		return err
+	}
+	commitCmd := exec.Command("git", "commit", "-m", "Initial commit")
+	commitCmd.Dir = dir
+	return commitCmd.Run()
 }
